@@ -218,3 +218,11 @@ Yes, in advanced settings (`Русский / English`).
 
 If you have suggestions to improve the bot or want to discuss collaboration, please send a direct message.
 
+
+
+## Community
+
+- Use **Issues** for bug reports and feature requests.
+- Use **Discussions** for ideas and Q&A.
+- For collaboration proposals, send a direct message.
+
