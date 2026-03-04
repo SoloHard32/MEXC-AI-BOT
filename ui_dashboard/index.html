@@ -1,0 +1,258 @@
+﻿<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CryptoEdge v3.2</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div id="brandTitle" class="brand">CryptoEdge v3.2</div>
+      <div class="top-meta">
+        <span id="connBadge" class="badge">-</span>
+        <span id="advisoryBadge" class="badge">Advisory: -</span>
+        <span id="tsText" class="chip">Обновление: -</span>
+        <span id="modeText" class="chip">Режим: -</span>
+        <span id="marketText" class="chip">SPOT/MEXC</span>
+        <span id="pidText" class="chip">PID: -</span>
+      </div>
+    </header>
+
+    <div id="banner" class="banner">AI обучение активно. DRY RUN — реальные ордера не отправляются.</div>
+
+    <main class="grid3">
+      <div class="col col-left">
+        <section class="card">
+          <h3 id="hControl">Управление ботом</h3>
+          <div class="control-grid">
+            <button id="btnStart" class="btn-accent" data-act="startBot" title="Запустить торговый/учебный цикл">Запуск</button>
+            <button id="btnStop" class="btn-warn" data-act="stopBot" title="Остановить текущий процесс бота">Стоп</button>
+            <button id="btnRestart" data-act="restartBot" title="Полный перезапуск приложения">Рестарт</button>
+            <button id="btnSave" data-act="saveSettings" title="Сохранить текущий режим и настройки GUI">Сохранить</button>
+            <button id="btnLogs" data-act="openLogFile" title="Открыть полный runtime лог-файл">Логи</button>
+            <button id="btnHealth" data-act="refreshHealth" title="Сформировать health_report.json">Health</button>
+          </div>
+          <div class="control-toggle-row">
+            <button id="btnSafeReset" data-act="safeReset" title="Очистить только runtime-кэш, не трогая модель">Safe reset</button>
+          </div>
+          <div class="control-toggle-row">
+            <button id="openLiveBtn" type="button" title="Открыть live-монитор в стиле панели">Live окно</button>
+            <button id="openAdvBtn" type="button" title="API ключи и служебные параметры">Расширенные настройки</button>
+          </div>
+          <div class="control-toggle-row">
+            <button id="btnOpenReport" data-act="openHealth" title="Открыть последний health report">Открыть report</button>
+            <button id="btnReportsDir" data-act="openReportsDir" title="Открыть папку с отчетами">Папка reports</button>
+          </div>
+          <div class="control-toggle-row">
+            <button id="btnExportAi" data-act="exportAi" title="Экспорт модели и состояния AI в zip">Экспорт AI</button>
+            <button id="btnImportAi" data-act="importAi" title="Импорт модели и состояния AI из zip">Импорт AI</button>
+          </div>
+          <div class="mode-line">
+            <span id="modeLabel" class="k">Режим:</span>
+            <div class="mode-switch">
+              <button id="modeTraining" class="mode-btn" type="button">training</button>
+              <button id="modeLive" class="mode-btn" type="button">live</button>
+            </div>
+          </div>
+          <div class="mini-kv" id="statusMini"></div>
+          <div class="badge-row">
+            <span id="badgeAiSignal" class="small-badge">AI signal: -</span>
+            <span id="badgeGuard" class="small-badge">Guard: -</span>
+          </div>
+        </section>
+        <section class="card">
+          <h3 id="hBalance">Баланс</h3>
+          <div class="kv" id="balanceCard"></div>
+        </section>
+        <section class="card">
+          <h3 id="hAiModule">AI модуль</h3>
+          <div class="kv" id="aiCard"></div>
+        </section>
+      </div>
+
+      <div class="col col-center">
+        <section class="card chart-card">
+          <div class="card-head">
+            <h3 id="hTelemetry">Телеметрия</h3>
+            <div class="head-pills">
+              <span id="telemetryPill" class="pill active">Backend Candles</span>
+            </div>
+          </div>
+          <canvas id="edgeChart" width="900" height="260"></canvas>
+        </section>
+        <section class="card logs-card">
+          <div class="log-head">
+            <h3 id="hLogs">Логи</h3>
+            <label><input type="checkbox" id="importantOnly" /> Важные</label>
+            <input id="logSearch" type="text" placeholder="Поиск..." />
+          </div>
+          <div class="tabs">
+            <button class="tab active" data-tab="all">Все</button>
+            <button class="tab" data-tab="trade">Сделки</button>
+            <button class="tab" data-tab="signal">Сигналы</button>
+            <button class="tab" data-tab="error">Ошибки</button>
+          </div>
+          <div id="logBox" class="logbox"></div>
+        </section>
+      </div>
+
+      <div class="col col-right">
+        <details class="card right-collapsible warnings" data-right-key="warnings">
+          <summary>
+            <h3 id="hWarnings">Предупреждения</h3>
+            <span class="chev" aria-hidden="true">▸</span>
+          </summary>
+          <div class="card-content">
+            <div id="warnBox">Нет критичных предупреждений</div>
+          </div>
+        </details>
+        <details class="card right-collapsible" data-right-key="training">
+          <summary>
+            <h3 id="hTraining">Обучение</h3>
+            <span class="chev" aria-hidden="true">▸</span>
+          </summary>
+          <div class="card-content">
+            <div class="kv" id="trainingCard"></div>
+          </div>
+        </details>
+        <details class="card right-collapsible" data-right-key="market">
+          <summary>
+            <h3 id="hMarket">Рынок</h3>
+            <span class="chev" aria-hidden="true">▸</span>
+          </summary>
+          <div class="card-content">
+            <div class="kv" id="marketCard"></div>
+          </div>
+        </details>
+        <details class="card right-collapsible" data-right-key="ops">
+          <summary>
+            <h3 id="hOps">Системная телеметрия</h3>
+            <span class="chev" aria-hidden="true">▸</span>
+          </summary>
+          <div class="card-content">
+            <div class="kv" id="opsCard"></div>
+            <div class="meter-stack">
+              <div class="meter-row">
+                <span id="lblCycleHealth" class="k">Стабильность цикла</span>
+                <span id="cycleHealthText" class="v">0%</span>
+              </div>
+              <div class="meter"><div id="cycleHealthBar" class="meter-fill"></div></div>
+              <div class="meter-row">
+                <span id="lblDecisionHealth" class="k">Качество решений</span>
+                <span id="decisionHealthText" class="v">0%</span>
+              </div>
+              <div class="meter"><div id="decisionHealthBar" class="meter-fill"></div></div>
+            </div>
+            <div id="opsHints" class="ops-hints">Ожидание телеметрии...</div>
+          </div>
+        </details>
+        <details class="card right-collapsible" data-right-key="session">
+          <summary>
+            <h3 id="hSession">Сессия сейчас</h3>
+            <span class="chev" aria-hidden="true">▸</span>
+          </summary>
+          <div class="card-content">
+            <div class="kv" id="sessionCard"></div>
+          </div>
+        </details>
+        <details class="card right-collapsible" data-right-key="guard">
+          <summary>
+            <h3 id="hGuard">Risk guard</h3>
+            <span class="chev" aria-hidden="true">▸</span>
+          </summary>
+          <div class="card-content">
+            <div class="kv" id="guardCard"></div>
+          </div>
+        </details>
+      </div>
+    </main>
+
+    <div id="advModal" class="modal hidden">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h3 id="hAdv">Расширенные настройки</h3>
+          <button id="advCloseBtn" type="button">Закрыть</button>
+        </div>
+        <div class="modal-body">
+          <label id="lblApiKey">API key (MEXC)</label>
+          <input id="apiKeyInput" type="text" placeholder="MEXC_API_KEY" />
+          <label id="lblApiSecret">API secret (MEXC)</label>
+          <input id="apiSecretInput" type="text" placeholder="MEXC_API_SECRET" />
+          <label id="lblAdvisoryEnable"><input id="advisoryEnabledInput" type="checkbox" /> Включить внешний advisory (overlay)</label>
+          <label id="lblAdvisoryName">Advisory provider name</label>
+          <input id="advisoryNameInput" type="text" placeholder="re7labs" />
+          <label id="lblAdvisoryUrl">Advisory URL</label>
+          <input id="advisoryUrlInput" type="text" placeholder="https://.../advisory" />
+          <div class="modal-grid2">
+            <div>
+              <label id="lblTimeoutSec">Timeout sec</label>
+              <input id="advisoryTimeoutInput" type="text" placeholder="0.35" />
+            </div>
+            <div>
+              <label id="lblTtlSec">TTL sec</label>
+              <input id="advisoryTtlInput" type="text" placeholder="10.0" />
+            </div>
+          </div>
+          <div class="modal-grid2">
+            <div>
+              <label id="lblWeightTraining">Weight training (0..0.35)</label>
+              <input id="advisoryWeightTrainingInput" type="text" placeholder="0.15" />
+            </div>
+            <div>
+              <label id="lblWeightLive">Weight live (0..0.35)</label>
+              <input id="advisoryWeightLiveInput" type="text" placeholder="0.22" />
+            </div>
+          </div>
+          <label id="lblPaperStart">Paper стартовый баланс (USDT, training)</label>
+          <input id="paperStartInput" type="text" placeholder="100.00" />
+          <label id="lblPaperApply"><input id="paperApplyNowInput" type="checkbox" /> Применить сразу (сбросить paper-позиции, только при остановленном боте)</label>
+          <label id="lblUiLanguage">Язык интерфейса</label>
+          <div class="lang-switch" id="uiLanguageSwitch">
+            <button type="button" id="uiLangRuBtn" class="lang-btn active">Русский</button>
+            <button type="button" id="uiLangEnBtn" class="lang-btn">English</button>
+          </div>
+          <input id="uiLanguageInput" type="hidden" value="ru" />
+          <div class="modal-actions">
+            <button id="advSaveBtn" type="button">Сохранить настройки</button>
+          </div>
+          <div id="advTestStatus" class="adv-test-status">Статус: автопроверка после сохранения</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="liveModal" class="modal hidden">
+      <div class="modal-card modal-wide">
+        <div class="modal-head">
+          <h3>Live мониторинг</h3>
+          <button id="liveCloseBtn" type="button">Закрыть</button>
+        </div>
+        <div class="live-grid">
+          <div class="card">
+            <h3>Сейчас</h3>
+            <div id="liveNow" class="kv"></div>
+          </div>
+          <div class="card">
+            <h3>AI / Рынок</h3>
+            <div id="liveAiMarket" class="kv"></div>
+          </div>
+          <div class="card">
+            <h3>Риск / Баланс</h3>
+            <div id="liveRisk" class="kv"></div>
+          </div>
+          <div class="card">
+            <h3>Последние ордера</h3>
+            <div id="liveOrders" class="bottom-events">Нет данных</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
