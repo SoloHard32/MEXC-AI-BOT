@@ -209,3 +209,12 @@ Typical reasons:
 
 **Can I switch GUI language?**  
 Yes, in advanced settings (`Русский / English`).
+
+### Контакты
+
+Если у вас есть предложения по улучшению бота или вопрос по сотрудничеству, напишите в личные сообщения.
+
+### Contact
+
+If you have suggestions to improve the bot or want to discuss collaboration, please send a direct message.
+
