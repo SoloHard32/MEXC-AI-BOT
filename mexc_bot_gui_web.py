@@ -315,7 +315,7 @@ class LiveMonitorDialog(QDialog):
 class BotWebWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("CryptoEdge v3.2")
+        self.setWindowTitle("MEXC AI BOT v1.0")
         self.resize(1660, 900)
 
         self.process: subprocess.Popen | None = None
@@ -1971,7 +1971,7 @@ class BotWebWindow(QMainWindow):
 
         state = {
             "header": {
-                "title": "CryptoEdge v3.2",
+                "title": "MEXC AI BOT v1.0",
                 "connection": connection,
                 "connection_text": (
                     "Подключено" if connection == "connected"
