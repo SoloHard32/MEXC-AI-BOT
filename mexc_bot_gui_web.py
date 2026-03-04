@@ -341,6 +341,9 @@ class BotWebWindow(QMainWindow):
         self._audit_summary_cache_key: tuple[str, int, float] | None = None
         self._audit_summary_cache_ts: float = 0.0
         self._audit_summary_cache_value: dict[str, object] = {}
+        self._last_audit_rebuild_ts: float = 0.0
+        self._audit_rebuild_min_sec: float = 8.0
+        self._last_refresh_error_ts: float = 0.0
         self._ui_state: dict[str, Any] = {}
         self.live_dialog: LiveMonitorDialog | None = None
         self._proc_lock = threading.RLock()
@@ -2140,7 +2143,7 @@ class BotWebWindow(QMainWindow):
             },
             "warnings": warnings,
             "recent_orders": orders[:30],
-            "logs": list(self._log_all)[-700:],
+            "logs": list(self._log_all)[-360:],
             "log_counts": {
                 "all": len(self._log_all),
                 "trade": len(self._log_trade),
@@ -2175,7 +2178,12 @@ class BotWebWindow(QMainWindow):
             and self._audit_summary_cache_value
         ):
             return dict(self._audit_summary_cache_value)
-        if mtime > 0 and (mtime != self._audit_cache_mtime or not self._audit_cache):
+        should_rebuild_audit_cache = (
+            mtime > 0
+            and (mtime != self._audit_cache_mtime or not self._audit_cache)
+            and ((now_ts - float(self._last_audit_rebuild_ts)) >= float(self._audit_rebuild_min_sec) or not self._audit_cache)
+        )
+        if should_rebuild_audit_cache:
             rows: list[dict[str, Any]] = []
             for ln in _tail_text_lines(AUDIT_PATH, max_lines=max(260, window * 2), max_bytes=400_000):
                 s = ln.strip()
@@ -2189,9 +2197,11 @@ class BotWebWindow(QMainWindow):
                     rows.append(obj)
             self._audit_cache = rows
             self._audit_cache_mtime = mtime
+            self._last_audit_rebuild_ts = now_ts
         elif mtime <= 0:
             self._audit_cache = []
             self._audit_cache_mtime = 0.0
+            self._last_audit_rebuild_ts = now_ts
 
         block_counter: Counter[str] = Counter()
         exit_counter: Counter[str] = Counter()
@@ -2257,18 +2267,24 @@ class BotWebWindow(QMainWindow):
         return out
 
     def _refresh_runtime(self) -> None:
-        state = self._build_state()
-        self._retune_timers(state)
         try:
-            controls = state.get("controls", {}) if isinstance(state.get("controls"), dict) else {}
-            if bool(controls.get("running", False)):
-                self._enforce_single_bot_process(force=False)
-        except Exception:
-            pass
-        self.bridge.stateChanged.emit(json.dumps(state, ensure_ascii=False))
-        self._refresh_live_dialog()
-        self._auto_refresh_reports_if_needed(state)
-        self._watchdog_tick(state)
+            state = self._build_state()
+            self._retune_timers(state)
+            try:
+                controls = state.get("controls", {}) if isinstance(state.get("controls"), dict) else {}
+                if bool(controls.get("running", False)):
+                    self._enforce_single_bot_process(force=False)
+            except Exception:
+                pass
+            self.bridge.stateChanged.emit(json.dumps(state, ensure_ascii=False))
+            self._refresh_live_dialog()
+            self._auto_refresh_reports_if_needed(state)
+            self._watchdog_tick(state)
+        except Exception as exc:
+            now_ts = time.time()
+            if (now_ts - float(getattr(self, "_last_refresh_error_ts", 0.0))) >= 3.0:
+                self._last_refresh_error_ts = now_ts
+                self.log_queue.put(f"{_stamp()} | ERROR | GUI refresh failed: {exc}")
 
     def _retune_timers(self, state: dict[str, Any]) -> None:
         """
