@@ -1,5 +1,12 @@
 ﻿# MEXC AI BOT v1.0
 
+[![CI](https://github.com/SoloHard32/MEXC-AI-BOT/actions/workflows/ci.yml/badge.svg)](https://github.com/SoloHard32/MEXC-AI-BOT/actions/workflows/ci.yml)
+![License](https://img.shields.io/github/license/SoloHard32/MEXC-AI-BOT?style=flat-square)
+![Stars](https://img.shields.io/github/stars/SoloHard32/MEXC-AI-BOT?style=flat-square)
+![Issues](https://img.shields.io/github/issues/SoloHard32/MEXC-AI-BOT?style=flat-square)
+![Last Commit](https://img.shields.io/github/last-commit/SoloHard32/MEXC-AI-BOT?style=flat-square)
+
+
 ## RU
 
 Автономный AI-бот для MEXC (spot) с desktop GUI (PySide6 + WebView), live-мониторингом, risk-guard, автоадаптацией параметров и онлайн-дообучением модели.
