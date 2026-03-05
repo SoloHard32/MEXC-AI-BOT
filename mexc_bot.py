@@ -1917,6 +1917,17 @@ class Bot:
                 if (not self.paper_positions) and cur_usdt < default_usdt:
                     self.paper_usdt_free = default_usdt
                     self._save_paper_state()
+                # Corruption guard: prevent runaway paper balance from transient price desync bugs.
+                max_reasonable = max(default_usdt * 1000.0, default_usdt + 10_000.0)
+                if (not self.paper_positions) and cur_usdt > max_reasonable:
+                    logging.warning(
+                        "Paper balance anomaly detected (%.4f > %.4f). Reset to configured start %.4f.",
+                        cur_usdt,
+                        max_reasonable,
+                        default_usdt,
+                    )
+                    self.paper_usdt_free = default_usdt
+                    self._save_paper_state()
         except Exception as exc:
             logging.info("Файл paper_state не читается (%s): %s. Используем дефолт.", path.name, exc)
 
@@ -4051,7 +4062,8 @@ class Bot:
                     now_q = time.time()
                     last_q_log = _safe_float(self._symbol_quarantine_log_ts.get(key), 0.0)
                     # Throttle repetitive quarantine logs to reduce GUI/log pressure.
-                    if (now_q - last_q_log) >= 30.0 or remaining <= 15:
+                    # Keep near-expiry updates more frequent so user still sees unban soon.
+                    if (now_q - last_q_log) >= 120.0 or remaining <= 30:
                         logging.info("Пара в карантине, пропуск: %s (еще ~%d сек)", sym, remaining)
                         self._symbol_quarantine_log_ts[key] = now_q
                     continue
@@ -5151,6 +5163,15 @@ class Bot:
                     candle_ref_price,
                     refs_drift_bps,
                 )
+                if self.config.AI_TRAINING_MODE and self.config.DRY_RUN:
+                    # In paper mode, a large ticker/candle desync may corrupt virtual balance accounting.
+                    logging.warning(
+                        "[TRADE] BUY_BLOCKED | symbol=%s | reason=paper_price_desync | drift=%.2f bps",
+                        symbol,
+                        refs_drift_bps,
+                    )
+                    self._register_api_soft_guard_if_needed("paper_price_desync:buy")
+                    return False
                 live_ref_price = candle_ref_price
         if live_ref_price <= 0 and candle_ref_price > 0:
             live_ref_price = candle_ref_price
@@ -5184,24 +5205,6 @@ class Bot:
         confirmed_delta_base = 0.0
 
         if self.config.AI_TRAINING_MODE and self.config.DRY_RUN:
-            # In paper mode, enforce symbol-scoped fresh price to avoid cross-symbol contamination.
-            try:
-                paper_ref_price = _safe_float(self.trader.last_price(symbol, force_refresh=True), 0.0)
-            except Exception:
-                paper_ref_price = 0.0
-            if paper_ref_price > 0 and _safe_float(price, 0.0) > 0:
-                paper_drift_bps = abs((_safe_float(price, 0.0) / paper_ref_price) - 1.0) * 10_000.0
-                if paper_drift_bps > 1200.0:
-                    logging.warning(
-                        "[TRADE] PAPER_PRICE_RESYNC | symbol=%s | stale_price=%.6f | live_price=%.6f | drift=%.2f bps",
-                        symbol,
-                        _safe_float(price, 0.0),
-                        paper_ref_price,
-                        paper_drift_bps,
-                    )
-                    price = paper_ref_price
-            elif _safe_float(price, 0.0) <= 0 and paper_ref_price > 0:
-                price = paper_ref_price
             usdt_before = _safe_float(self.paper_usdt_free, 0.0)
             usdt_spent = min(usdt_cost, usdt_before)
             if usdt_spent <= 0 or price <= 0:
