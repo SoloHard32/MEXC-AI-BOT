@@ -1674,6 +1674,24 @@ class Bot:
         self.exec_slippage_ema_bps: float = 0.0
         self.symbol_quality_ema: Dict[str, float] = {}
         self.symbol_trade_count: Dict[str, int] = {}
+        self.symbol_exec_slippage_ema_bps: Dict[str, float] = {}
+        self.symbol_exec_quality_ema: Dict[str, float] = {}
+        self.regime_trade_feedback: Dict[str, Dict[str, float]] = {}
+        self.symbol_regime_trade_feedback: Dict[str, Dict[str, float]] = {}
+        self.shared_learning_feedback: Dict[str, float] = {
+            "ema_pass": 0.25,
+            "ema_quality": 0.50,
+            "ema_conf": 0.50,
+            "ema_edge_margin": 0.0,
+            "ema_trade_score": 0.50,
+            "ema_cycle_score": 0.50,
+            "training_weight": 0.0,
+            "live_weight": 0.0,
+            "updated_ts": 0.0,
+        }
+        self.recent_trade_scores: deque[float] = deque(maxlen=120)
+        self.recent_cycle_feedback: deque[Dict[str, object]] = deque(maxlen=220)
+        self.recent_decision_scores: deque[float] = deque(maxlen=220)
         self.symbol_loss_streak: Dict[str, int] = {}
         self.symbol_quarantine_until_ts: Dict[str, float] = {}
         self._symbol_quarantine_log_ts: Dict[str, float] = {}
@@ -1689,6 +1707,11 @@ class Bot:
         self._partial_sell_warn_until_ts: Dict[str, float] = {}
         self._last_symbol_scan_ts: float = 0.0
         self._last_symbol_scan_result: Tuple[str, int, int] = (self.config.SYMBOL, 1, 1)
+        self._last_cycle_started_ts: float = 0.0
+        self._last_cycle_completed_ts: float = 0.0
+        self._slow_cycle_streak: int = 0
+        self._last_cycle_watchdog_event: str = ""
+        self._last_cycle_watchdog_log_ts: float = 0.0
         self.runtime_advisory: Dict[str, object] = {}
         self._mtf_cache: Dict[str, Tuple[float, bool, Dict[str, float]]] = {}
         self._symbol_rr_index: int = 0
@@ -1764,6 +1787,8 @@ class Bot:
 
         st = self.regime_edge_autotune.get(r)
         learned = _safe_float((st or {}).get("mult"), prior)
+        bias = self._regime_trade_bias(r)
+        learned *= _safe_float(bias.get("edge_mult"), 1.0)
         # Keep live stricter bounds than training.
         lo = 0.78 if self.config.DRY_RUN else 0.84
         hi = 1.36 if self.config.DRY_RUN else 1.30
@@ -1915,6 +1940,17 @@ class Bot:
             if self.config.AI_TRAINING_MODE and self.config.DRY_RUN:
                 cur_usdt = max(0.0, _safe_float(self.paper_usdt_free, 0.0))
                 if (not self.paper_positions) and cur_usdt < default_usdt:
+                    self.paper_usdt_free = default_usdt
+                    self._save_paper_state()
+                # Corruption guard: prevent runaway paper balance from transient price desync bugs.
+                max_reasonable = max(default_usdt * 1000.0, default_usdt + 10_000.0)
+                if (not self.paper_positions) and cur_usdt > max_reasonable:
+                    logging.warning(
+                        "Paper balance anomaly detected (%.4f > %.4f). Reset to configured start %.4f.",
+                        cur_usdt,
+                        max_reasonable,
+                        default_usdt,
+                    )
                     self.paper_usdt_free = default_usdt
                     self._save_paper_state()
         except Exception as exc:
@@ -2315,6 +2351,65 @@ class Bot:
                         "updated_ts": _safe_float(v.get("updated_ts"), 0.0),
                     }
                 self.regime_edge_autotune = restored
+            raw_feedback = payload.get("regime_trade_feedback", {})
+            if isinstance(raw_feedback, dict):
+                restored_feedback: Dict[str, Dict[str, float]] = {}
+                for k, v in raw_feedback.items():
+                    rk = str(k or "").strip().lower()
+                    if not rk or not isinstance(v, dict):
+                        continue
+                    restored_feedback[rk] = {
+                        "ema_pnl": _safe_float(v.get("ema_pnl"), 0.0),
+                        "ema_win": _safe_float(v.get("ema_win"), 0.5),
+                        "ema_quality": _safe_float(v.get("ema_quality"), 0.5),
+                        "ema_edge": _safe_float(v.get("ema_edge"), 0.0),
+                        "ema_exit_efficiency": _safe_float(v.get("ema_exit_efficiency"), 0.5),
+                        "count": _safe_float(v.get("count"), 0.0),
+                        "updated_ts": _safe_float(v.get("updated_ts"), 0.0),
+                    }
+                self.regime_trade_feedback = restored_feedback
+            raw_symbol_feedback = payload.get("symbol_regime_trade_feedback", {})
+            if isinstance(raw_symbol_feedback, dict):
+                restored_symbol_feedback: Dict[str, Dict[str, float]] = {}
+                for k, v in raw_symbol_feedback.items():
+                    sk = str(k or "").strip().upper()
+                    if not sk or not isinstance(v, dict):
+                        continue
+                    restored_symbol_feedback[sk] = {
+                        "ema_pnl": _safe_float(v.get("ema_pnl"), 0.0),
+                        "ema_win": _safe_float(v.get("ema_win"), 0.5),
+                        "ema_decision": _safe_float(v.get("ema_decision"), 0.5),
+                        "count": _safe_float(v.get("count"), 0.0),
+                        "updated_ts": _safe_float(v.get("updated_ts"), 0.0),
+                    }
+                self.symbol_regime_trade_feedback = restored_symbol_feedback
+            raw_symbol_exec_slippage = payload.get("symbol_exec_slippage_ema_bps", {})
+            if isinstance(raw_symbol_exec_slippage, dict):
+                self.symbol_exec_slippage_ema_bps = {
+                    str(k or "").strip().upper(): _safe_float(v, 0.0)
+                    for k, v in raw_symbol_exec_slippage.items()
+                    if str(k or "").strip()
+                }
+            raw_symbol_exec_quality = payload.get("symbol_exec_quality_ema", {})
+            if isinstance(raw_symbol_exec_quality, dict):
+                self.symbol_exec_quality_ema = {
+                    str(k or "").strip().upper(): _safe_float(v, 0.0)
+                    for k, v in raw_symbol_exec_quality.items()
+                    if str(k or "").strip()
+                }
+            raw_shared_learning = payload.get("shared_learning_feedback", {})
+            if isinstance(raw_shared_learning, dict):
+                self.shared_learning_feedback = {
+                    "ema_pass": _safe_float(raw_shared_learning.get("ema_pass"), 0.25),
+                    "ema_quality": _safe_float(raw_shared_learning.get("ema_quality"), 0.50),
+                    "ema_conf": _safe_float(raw_shared_learning.get("ema_conf"), 0.50),
+                    "ema_edge_margin": _safe_float(raw_shared_learning.get("ema_edge_margin"), 0.0),
+                    "ema_trade_score": _safe_float(raw_shared_learning.get("ema_trade_score"), 0.50),
+                    "ema_cycle_score": _safe_float(raw_shared_learning.get("ema_cycle_score"), 0.50),
+                    "training_weight": _safe_float(raw_shared_learning.get("training_weight"), 0.0),
+                    "live_weight": _safe_float(raw_shared_learning.get("live_weight"), 0.0),
+                    "updated_ts": _safe_float(raw_shared_learning.get("updated_ts"), 0.0),
+                }
         except Exception as exc:
             logging.warning("Не удалось загрузить состояние risk guard: %s", exc)
 
@@ -2342,6 +2437,11 @@ class Bot:
                     "last_error_type": str(self.guard_state.get("last_error_type", "") or ""),
                     "last_error": str(self.guard_state.get("last_error", "") or ""),
                     "regime_edge_autotune": dict(self.regime_edge_autotune),
+                    "regime_trade_feedback": dict(self.regime_trade_feedback),
+                    "symbol_regime_trade_feedback": dict(self.symbol_regime_trade_feedback),
+                    "symbol_exec_slippage_ema_bps": dict(self.symbol_exec_slippage_ema_bps),
+                    "symbol_exec_quality_ema": dict(self.symbol_exec_quality_ema),
+                    "shared_learning_feedback": dict(self.shared_learning_feedback),
                 }
                 _write_json_atomic(path, payload)
         except Exception as exc:
@@ -2701,6 +2801,8 @@ class Bot:
             cycle_index = 0
             while not self.stop_requested:
                 cycle_index += 1
+                cycle_started_ts = time.time()
+                self._last_cycle_started_ts = cycle_started_ts
                 try:
                     self._run_cycle(cycle_index)
                     self._register_cycle_success()
@@ -2720,6 +2822,23 @@ class Bot:
                         "recent_orders": list(self.recent_orders),
                         "risk_guard": self._guard_payload(),
                     })
+                finally:
+                    cycle_elapsed_sec = max(0.0, time.time() - cycle_started_ts)
+                    self._last_cycle_completed_ts = time.time()
+                    watchdog_res = self._cycle_runtime_watchdog(
+                        cycle_index=cycle_index,
+                        cycle_elapsed_sec=cycle_elapsed_sec,
+                        last_event=str(getattr(self, "_last_cycle_event", "") or ""),
+                    )
+                    if bool(watchdog_res.get("triggered", False)):
+                        logging.warning(
+                            "Cycle watchdog | action=%s | cycle=%s | elapsed=%.2fs | event=%s | reason=%s",
+                            str(watchdog_res.get("action", "") or "-"),
+                            cycle_index,
+                            cycle_elapsed_sec,
+                            str(watchdog_res.get("event", "") or "-"),
+                            str(watchdog_res.get("reason", "") or "-"),
+                        )
 
                 self._sleep_with_countdown(self._next_cycle_sleep_seconds())
         finally:
@@ -3110,6 +3229,12 @@ class Bot:
         regime_name = str(market_ctx.get("regime", "flat") or "flat").lower().strip()
         regime_flags_raw = market_ctx.get("flags", [])
         regime_flags = {str(x).lower().strip() for x in regime_flags_raw} if isinstance(regime_flags_raw, list) else set()
+        symbol_regime_bias = self._symbol_regime_trade_bias(symbol, regime_name)
+        symbol_live_bias = self._symbol_regime_live_bias(symbol, regime_name)
+        cycle_bias = self._cycle_adaptive_bias(symbol, regime_name)
+        execution_profile = self._execution_profile_bias()
+        shared_learning_bias = self._shared_learning_bias()
+        execution_stress = self._execution_stress_mode()
         tiny_balance_weak_market = (
             equity_usdt > 0
             and equity_usdt <= 5.0
@@ -3178,6 +3303,31 @@ class Bot:
                 self.config.AI_MIN_CONFIDENCE - 0.02,
                 ai_min_conf_required - 0.02,
             )
+        ai_entry_min_quality = _clamp(
+            ai_entry_min_quality
+            + _safe_float(symbol_regime_bias.get("quality_delta"), 0.0)
+            + _safe_float(symbol_live_bias.get("quality_delta"), 0.0)
+            + _safe_float(cycle_bias.get("quality_delta"), 0.0)
+            + _safe_float(execution_profile.get("quality_delta"), 0.0),
+            max(0.18, self.config.AI_ENTRY_MIN_QUALITY - 0.10),
+            0.96,
+        )
+        ai_entry_min_quality = _clamp(
+            ai_entry_min_quality
+            + _safe_float(shared_learning_bias.get("quality_delta"), 0.0)
+            + _safe_float(execution_stress.get("quality_delta"), 0.0),
+            max(0.18, self.config.AI_ENTRY_MIN_QUALITY - 0.10),
+            0.96,
+        )
+        ai_min_conf_required = _clamp(
+            ai_min_conf_required
+            + _safe_float(cycle_bias.get("conf_delta"), 0.0)
+            + _safe_float(execution_profile.get("conf_delta"), 0.0)
+            + _safe_float(shared_learning_bias.get("conf_delta"), 0.0)
+            + _safe_float(execution_stress.get("conf_delta"), 0.0),
+            max(0.18, self.config.AI_MIN_CONFIDENCE - 0.10),
+            0.98,
+        )
         ai_quality_ok = ai_entry_quality >= ai_entry_min_quality
         ai_gate_ok = bool(ai_signal) and ai_filter_ok and ai_conf >= ai_min_conf_required and ai_quality_ok
         mtf_pass, mtf_meta = self._mtf_confirmation(symbol)
@@ -3256,7 +3406,8 @@ class Bot:
                 self._clear_position_memory(symbol)
 
         locked_risk = self._risk_from_memory(symbol) if has_open_position else None
-        active_risk = locked_risk if locked_risk else self._get_active_risk_profile(ai_signal, ohlcv)
+        adaptive_symbol_cooldown = self._adaptive_symbol_market_cooldown(symbol, regime_name)
+        active_risk = locked_risk if locked_risk else self._get_active_risk_profile(symbol, ai_signal, ohlcv)
         atr_pct = self._atr_pct(ohlcv)
         dynamic_time_stop_candles = self._dynamic_time_stop_candles(active_risk, ai_signal, atr_pct)
         expected_edge_pct = self._expected_edge_pct(active_risk, ai_entry_quality)
@@ -3282,6 +3433,16 @@ class Bot:
                 self.config.AI_RISK_FRACTION_MIN,
                 active_risk["fraction"] * self._loss_streak_risk_scale(),
             )
+        active_risk["fraction"] = max(
+            self.config.AI_RISK_FRACTION_MIN,
+            active_risk["fraction"]
+            * _safe_float(symbol_live_bias.get("risk_mult"), 1.0)
+            * _safe_float(execution_profile.get("risk_mult"), 1.0),
+        )
+        active_risk["fraction"] = max(
+            self.config.AI_RISK_FRACTION_MIN,
+            active_risk["fraction"] * _safe_float(execution_stress.get("risk_mult"), 1.0),
+        )
         active_risk, tp_adaptation = self._apply_open_position_tp_adaptation(
             symbol=symbol,
             has_open_position=has_open_position,
@@ -3292,6 +3453,12 @@ class Bot:
             momentum_speed=momentum_speed,
             anomaly_score=anomaly_score,
         )
+        adaptive_cooldown_score = _safe_float(adaptive_symbol_cooldown.get("score"), 0.0)
+        if adaptive_cooldown_score >= 0.24:
+            active_risk["fraction"] = max(
+                self.config.AI_RISK_FRACTION_MIN,
+                active_risk["fraction"] * _clamp(0.96 - (adaptive_cooldown_score * 0.18), 0.80, 0.96),
+            )
         # Entry TP sanity cap for tiny balances in weak spot market.
         if (
             not has_open_position
@@ -3387,6 +3554,19 @@ class Bot:
         elif (not self.config.DRY_RUN) and (not self.config.AI_TRAINING_MODE):
             # Live mode: keep edge guard, but avoid dead periods in flat low-vol.
             min_expected_edge_pct = max(0.00145, min_expected_edge_pct - 0.00085)
+        min_expected_edge_pct = max(
+            0.0010,
+            min_expected_edge_pct
+            + _safe_float(symbol_regime_bias.get("edge_delta"), 0.0)
+            + _safe_float(symbol_live_bias.get("edge_delta"), 0.0)
+            + _safe_float(cycle_bias.get("edge_delta"), 0.0)
+            + _safe_float(shared_learning_bias.get("edge_delta"), 0.0),
+        )
+        min_expected_edge_pct = max(0.0010, min_expected_edge_pct + _safe_float(execution_profile.get("edge_delta"), 0.0))
+        min_expected_edge_pct = max(0.0010, min_expected_edge_pct + _safe_float(execution_stress.get("edge_delta"), 0.0))
+        if adaptive_cooldown_score >= 0.18:
+            min_expected_edge_pct = max(0.0010, min_expected_edge_pct + min(0.0011, adaptive_cooldown_score * 0.0014))
+            signal_debounce_required = max(signal_debounce_required, 3 if adaptive_cooldown_score >= 0.42 else 2)
 
         # Autonomous regime-aware edge adaptation (internal, no manual knobs).
         regime_mult = self._regime_edge_multiplier(
@@ -3458,6 +3638,9 @@ class Bot:
             debounce_required -= 1
         if regime_name == "trend" and micro_noise < 0.58 and anomaly_score < 0.65:
             debounce_required -= 1
+        debounce_required += int(_safe_float(cycle_bias.get("debounce_delta"), 0.0))
+        debounce_required += int(_safe_float(symbol_live_bias.get("debounce_delta"), 0.0))
+        debounce_required += int(_safe_float(execution_profile.get("debounce_delta"), 0.0))
         signal_debounce_required = max(1, min(4, debounce_required))
         if self.config.DRY_RUN and self.config.AI_TRAINING_MODE:
             signal_debounce_required = max(1, signal_debounce_required - 1)
@@ -3568,7 +3751,10 @@ class Bot:
             and has_dust_position
             and topup_usdt > 0
         )
-        symbol_internal_cooldown_sec = self._symbol_internal_cooldown_remaining_sec(symbol)
+        static_symbol_cooldown_sec = self._symbol_internal_cooldown_remaining_sec(symbol)
+        adaptive_symbol_cooldown = self._adaptive_symbol_market_cooldown(symbol, regime_name)
+        adaptive_symbol_cooldown_sec = int(max(0.0, _safe_float(adaptive_symbol_cooldown.get("seconds"), 0.0)))
+        symbol_internal_cooldown_sec = max(static_symbol_cooldown_sec, adaptive_symbol_cooldown_sec)
         symbol_internal_cooldown_block = (
             symbol_internal_cooldown_sec > 0
             and not has_open_position
@@ -3632,29 +3818,41 @@ class Bot:
             entry_policy.can_enter
             and self._can_afford_buy(usdt_free, spot_buy_usdt)
         ):
-            order_attempted = True
-            buy_reason = "dust_recovery" if dust_recovery_buy and not buy_trigger else "signal"
-            if self.config.TRADE_MARKET == "futures":
-                entry_side = "SHORT" if (short_entry_trigger and not buy_trigger) else "LONG"
-                entry_exec = self.execution_engine.run(
-                    lambda: self._execute_futures_entry(
-                        symbol, spot_buy_usdt, price, latest_candle_ts, active_risk, entry_side=entry_side, reason=buy_reason
-                    ),
-                    ok_event="buy",
-                    fail_event="training_no_signal" if self.config.AI_TRAINING_MODE else "entry_blocked",
-                )
-                did_buy = bool(entry_exec.ok)
+            guard_ok, guard_reason_pretrade = self._pretrade_execution_guard(
+                symbol=symbol,
+                side="buy",
+                notional_usdt=spot_buy_usdt,
+                price_hint=price,
+                ai_quality=ai_entry_quality,
+                expected_edge_pct=expected_edge_pct,
+            )
+            if not guard_ok:
+                buy_block_reasons.append(f"pretrade:{guard_reason_pretrade}")
+                event = "entry_blocked"
             else:
-                entry_exec = self.execution_engine.run(
-                    lambda: self._execute_buy(symbol, spot_buy_usdt, price, latest_candle_ts, active_risk, reason=buy_reason),
-                    ok_event="buy",
-                    fail_event="training_no_signal" if self.config.AI_TRAINING_MODE else "entry_blocked",
-                )
-                did_buy = bool(entry_exec.ok)
-            if did_buy:
-                event = "training_buy_signal" if self.config.AI_TRAINING_MODE else "buy"
-            elif self.config.AI_TRAINING_MODE:
-                event = "training_no_signal"
+                order_attempted = True
+                buy_reason = "dust_recovery" if dust_recovery_buy and not buy_trigger else "signal"
+                if self.config.TRADE_MARKET == "futures":
+                    entry_side = "SHORT" if (short_entry_trigger and not buy_trigger) else "LONG"
+                    entry_exec = self.execution_engine.run(
+                        lambda: self._execute_futures_entry(
+                            symbol, spot_buy_usdt, price, latest_candle_ts, active_risk, entry_side=entry_side, reason=buy_reason
+                        ),
+                        ok_event="buy",
+                        fail_event="training_no_signal" if self.config.AI_TRAINING_MODE else "entry_blocked",
+                    )
+                    did_buy = bool(entry_exec.ok)
+                else:
+                    entry_exec = self.execution_engine.run(
+                        lambda: self._execute_buy(symbol, spot_buy_usdt, price, latest_candle_ts, active_risk, reason=buy_reason),
+                        ok_event="buy",
+                        fail_event="training_no_signal" if self.config.AI_TRAINING_MODE else "entry_blocked",
+                    )
+                    did_buy = bool(entry_exec.ok)
+                if did_buy:
+                    event = "training_buy_signal" if self.config.AI_TRAINING_MODE else "buy"
+                elif self.config.AI_TRAINING_MODE:
+                    event = "training_no_signal"
         elif buy_intent and not has_open_position and (
             buy_blocked_by_guard or (not entry_policy.can_enter)
         ):
@@ -3735,6 +3933,29 @@ class Bot:
             self._last_trade_event_ts = time.time()
         elif event in no_trade_events:
             self._no_trade_streak_cycles = min(5000, int(self._no_trade_streak_cycles) + 1)
+        self._update_cycle_feedback(
+            symbol=symbol,
+            regime=regime_name,
+            event=event,
+            buy_block_reasons=buy_block_reasons,
+            ai_quality=ai_entry_quality,
+            ai_conf=ai_conf,
+            expected_edge_pct=expected_edge_pct,
+            min_expected_edge_pct=min_expected_edge_pct,
+            market_data_stale=bool(market_data_stale),
+        )
+        runtime_recover = self._runtime_degradation_recover(
+            event=event,
+            symbol=symbol,
+            market_data_stale=bool(market_data_stale),
+        )
+        if bool(runtime_recover.get("triggered", False)):
+            logging.info(
+                "Runtime auto-recover | action=%s | symbol=%s | reason=%s",
+                str(runtime_recover.get("action", "") or "-"),
+                symbol,
+                str(runtime_recover.get("reason", "") or "-"),
+            )
 
         if event in {"entry_blocked", "risk_guard_blocked"}:
             if guard_reason:
@@ -3831,6 +4052,20 @@ class Bot:
             usdt_free=usdt_free,
             base_free=base_free,
         )
+        recent_decision_quality = 0.0
+        trade_quality = 0.0
+        cycle_quality = 0.0
+        if self.recent_trade_scores:
+            trade_quality = float(sum(self.recent_trade_scores) / max(1, len(self.recent_trade_scores)))
+        if self.recent_decision_scores:
+            cycle_quality = float(sum(self.recent_decision_scores) / max(1, len(self.recent_decision_scores)))
+        if self.recent_trade_scores and self.recent_decision_scores:
+            recent_decision_quality = float(_clamp((trade_quality * 0.42) + (cycle_quality * 0.58), 0.0, 1.0))
+        elif self.recent_decision_scores:
+            recent_decision_quality = cycle_quality
+        else:
+            recent_decision_quality = trade_quality
+        regime_bias_runtime = self._regime_trade_bias(str(market_ctx.get("regime", "flat")))
         stage_profile["cycle_ms"] = round((time.perf_counter() - cycle_t0) * 1000.0, 1)
         self._write_live_status({
             "ts_utc": datetime.now(timezone.utc).isoformat(),
@@ -3885,6 +4120,8 @@ class Bot:
             "mtf_confirmation": mtf_meta,
             "loss_streak_live": int(self.loss_streak_live),
             "exec_slippage_ema_bps": float(self.exec_slippage_ema_bps),
+            "symbol_exec_slippage_ema_bps": float(_safe_float(self.symbol_exec_slippage_ema_bps.get(symbol.upper(), 0.0), 0.0)),
+            "symbol_exec_quality_ema": float(_safe_float(self.symbol_exec_quality_ema.get(symbol.upper(), 0.50), 0.50)),
             "post_time_stop_block": post_time_stop_block,
             "post_time_stop_wait_candles": post_time_stop_wait_candles,
             "signal_debounce_count": signal_debounce_count,
@@ -3894,6 +4131,7 @@ class Bot:
             "no_trade_streak_cycles": int(self._no_trade_streak_cycles),
             "last_trade_event_age_sec": (0.0 if self._last_trade_event_ts <= 0 else max(0.0, time.time() - self._last_trade_event_ts)),
             "symbol_internal_cooldown_remaining_sec": symbol_internal_cooldown_sec,
+            "adaptive_symbol_cooldown": dict(adaptive_symbol_cooldown),
             "buy_block_reasons": buy_block_reasons,
             "market_regime": str(market_ctx.get("regime", "flat")),
             "market_flags": market_ctx.get("flags", []),
@@ -3907,6 +4145,16 @@ class Bot:
             "drift_active": drift_active_runtime,
             "adaptive_runtime_params": dict(self.runtime_params),
             "adaptive_last_event": dict(self.runtime_adaptation),
+            "runtime_recover": dict(runtime_recover),
+            "shared_learning_bias": dict(shared_learning_bias),
+            "execution_stress": dict(execution_stress),
+            "regime_trade_feedback": dict(self.regime_trade_feedback.get(str(market_ctx.get("regime", "flat")).strip().lower(), {})),
+            "regime_trade_bias": dict(regime_bias_runtime),
+            "symbol_regime_bias": dict(symbol_regime_bias),
+            "symbol_live_bias": dict(symbol_live_bias),
+            "cycle_adaptive_bias": dict(cycle_bias),
+            "execution_profile": dict(execution_profile),
+            "recent_decision_quality": recent_decision_quality,
             "cycle_snapshot": dict(cycle_snapshot.__dict__),
             "position_state_machine": {
                 "state": pos_state.state,
@@ -4010,7 +4258,10 @@ class Bot:
         if self.config.TRADE_MARKET == "futures":
             return self.config.SYMBOL, 1, 1
         if self.active_symbol:
-            return self.active_symbol, 1, 1
+            dyn_cd = self._adaptive_symbol_market_cooldown(self.active_symbol)
+            blocked, _ = self._is_symbol_quarantined(self.active_symbol)
+            if (not blocked) and _safe_float(dyn_cd.get("seconds"), 0.0) <= 0:
+                return self.active_symbol, 1, 1
         if self.config.AI_TRAINING_MODE and self.config.DRY_RUN and self._paper_has_open_position():
             return self.active_symbol or self.config.SYMBOL, 1, 1
         if not self.config.AUTO_SYMBOL_SELECTION:
@@ -4051,7 +4302,8 @@ class Bot:
                     now_q = time.time()
                     last_q_log = _safe_float(self._symbol_quarantine_log_ts.get(key), 0.0)
                     # Throttle repetitive quarantine logs to reduce GUI/log pressure.
-                    if (now_q - last_q_log) >= 30.0 or remaining <= 15:
+                    # Keep near-expiry updates more frequent so user still sees unban soon.
+                    if (now_q - last_q_log) >= 120.0 or remaining <= 30:
                         logging.info("Пара в карантине, пропуск: %s (еще ~%d сек)", sym, remaining)
                         self._symbol_quarantine_log_ts[key] = now_q
                     continue
@@ -4068,6 +4320,10 @@ class Bot:
             for sym in non_quarantined:
                 scanned += 1
                 try:
+                    dyn_cd_meta = self._adaptive_symbol_market_cooldown(sym)
+                    dyn_cd_sec = _safe_float(dyn_cd_meta.get("seconds"), 0.0)
+                    if dyn_cd_sec > 0:
+                        continue
                     ohlcv = self.trader.fetch_ohlcv(sym, self.config.TIMEFRAME, self.config.AI_LOOKBACK)
                     
                     score = -1.0
@@ -4084,6 +4340,27 @@ class Bot:
                             score = sig.score
                             # Internal pair quality memory: prefer symbols with better recent realized quality.
                             score += _safe_float(self.symbol_quality_ema.get(sym.upper(), 0.0), 0.0) * 14.0
+                            regime_local = "flat"
+                            try:
+                                market_ctx_local = self.adaptive_agent.detect_market_regime(ohlcv)
+                                regime_local = str(market_ctx_local.get("regime", "flat") or "flat").lower().strip()
+                            except Exception:
+                                regime_local = "flat"
+                            regime_bias = self._regime_trade_bias(regime_local)
+                            symbol_regime_bias = self._symbol_regime_trade_bias(sym, regime_local)
+                            symbol_live_bias = self._symbol_regime_live_bias(sym, regime_local)
+                            symbol_exec_bias = self._symbol_execution_bias(sym)
+                            score -= max(0.0, _safe_float(regime_bias.get("exit_bias"), 0.0)) * 0.90
+                            score += max(0.0, 1.0 - _safe_float(regime_bias.get("edge_mult"), 1.0)) * 0.35
+                            score -= max(0.0, _safe_float(symbol_regime_bias.get("edge_delta"), 0.0)) * 1200.0
+                            score -= max(0.0, _safe_float(symbol_live_bias.get("edge_delta"), 0.0)) * 1000.0
+                            score -= max(0.0, _safe_float(symbol_live_bias.get("quality_delta"), 0.0)) * 18.0
+                            score += max(0.0, _safe_float(symbol_live_bias.get("risk_mult"), 1.0) - 1.0) * 1.8
+                            score -= max(0, int(_safe_float(symbol_live_bias.get("debounce_delta"), 0.0))) * 0.18
+                            score -= max(0.0, _safe_float(symbol_exec_bias.get("edge_delta"), 0.0)) * 1300.0
+                            score += max(0.0, _safe_float(symbol_exec_bias.get("risk_mult"), 1.0) - 1.0) * 1.6
+                            score += max(0.0, _safe_float(symbol_exec_bias.get("exec_quality"), 0.5) - 0.5) * 1.9
+                            score -= max(0.0, _safe_float(symbol_exec_bias.get("slippage_bps"), 0.0) - 2.0) * 0.015
                     else:
                         price, sma = self._price_sma_from_ohlcv(ohlcv)
                         buy, _, dev = self._get_sma_signal(price, sma)
@@ -4248,6 +4525,653 @@ class Bot:
         if entry_slippage_bps > 0:
             beta = 0.20
             self.exec_slippage_ema_bps = (1.0 - beta) * self.exec_slippage_ema_bps + beta * entry_slippage_bps
+            prev_symbol_slip = _safe_float(self.symbol_exec_slippage_ema_bps.get(sym, 0.0), 0.0)
+            self.symbol_exec_slippage_ema_bps[sym] = (1.0 - beta) * prev_symbol_slip + beta * entry_slippage_bps
+        exec_quality_score = 0.50
+        slip_penalty = _clamp(max(0.0, entry_slippage_bps) / 14.0, 0.0, 1.0)
+        if touch_outcome:
+            pnl_component = _clamp(0.50 + (pnl_net_pct / 0.015), 0.0, 1.0)
+            exec_quality_score = _clamp((0.58 * pnl_component) + (0.42 * (1.0 - slip_penalty)), 0.0, 1.0)
+        elif entry_slippage_bps > 0:
+            exec_quality_score = _clamp(0.56 * (1.0 - slip_penalty), 0.0, 1.0)
+        gamma = 0.18
+        prev_exec_q = _safe_float(self.symbol_exec_quality_ema.get(sym, 0.50), 0.50)
+        self.symbol_exec_quality_ema[sym] = (1.0 - gamma) * prev_exec_q + gamma * exec_quality_score
+
+    @staticmethod
+    def _recency_alpha(duration_sec: float, dry_run: bool) -> float:
+        dur = max(0.0, _safe_float(duration_sec, 0.0))
+        base = 0.14 if dry_run else 0.11
+        if dur <= 0:
+            return base
+        if dur <= 900:
+            return min(0.24, base + 0.06)
+        if dur <= 3600:
+            return min(0.20, base + 0.03)
+        return max(0.07, base - 0.02)
+
+    def _update_regime_trade_feedback(
+        self,
+        *,
+        symbol: str,
+        regime: str,
+        pnl_pct_net: float,
+        entry_quality: float,
+        entry_edge: float,
+        exit_reason: str,
+        duration_sec: float,
+    ) -> None:
+        rk = str(regime or "flat").strip().lower()
+        if not rk:
+            rk = "flat"
+        st = self.regime_trade_feedback.get(rk, {})
+        alpha = self._recency_alpha(duration_sec, bool(self.config.DRY_RUN))
+        exit_reason_norm = str(exit_reason or "").strip().lower()
+        win_now = 1.0 if pnl_pct_net > 0 else 0.0
+        # Reward clean TP/trailing exits more than defensive exits.
+        exit_eff_now = 0.50
+        if exit_reason_norm in {"take_profit", "trailing_stop"}:
+            exit_eff_now = 1.0
+        elif exit_reason_norm in {"smart_stagnation_exit", "stall_exit"}:
+            exit_eff_now = 0.65 if pnl_pct_net >= 0 else 0.35
+        elif exit_reason_norm in {"stop_loss", "time_stop", "ai_quality_fade"}:
+            exit_eff_now = 0.15 if pnl_pct_net < 0 else 0.45
+        ema_pnl = ((1.0 - alpha) * _safe_float(st.get("ema_pnl"), 0.0)) + (alpha * pnl_pct_net)
+        ema_win = ((1.0 - alpha) * _safe_float(st.get("ema_win"), 0.5)) + (alpha * win_now)
+        ema_quality = ((1.0 - alpha) * _safe_float(st.get("ema_quality"), 0.5)) + (alpha * _clamp(entry_quality, 0.0, 1.0))
+        ema_edge = ((1.0 - alpha) * _safe_float(st.get("ema_edge"), 0.0)) + (alpha * entry_edge)
+        ema_exit_eff = ((1.0 - alpha) * _safe_float(st.get("ema_exit_efficiency"), 0.5)) + (alpha * exit_eff_now)
+        self.regime_trade_feedback[rk] = {
+            "ema_pnl": float(ema_pnl),
+            "ema_win": float(ema_win),
+            "ema_quality": float(ema_quality),
+            "ema_edge": float(ema_edge),
+            "ema_exit_efficiency": float(ema_exit_eff),
+            "count": float(_safe_float(st.get("count"), 0.0) + 1.0),
+            "updated_ts": float(time.time()),
+        }
+        score_now = _clamp((win_now * 0.55) + (max(-0.03, min(0.03, pnl_pct_net)) * 8.0) + (exit_eff_now * 0.20), 0.0, 1.0)
+        self.recent_trade_scores.append(float(score_now))
+        self._update_shared_learning_feedback(
+            ai_quality=entry_quality,
+            ai_conf=_clamp(entry_quality + 0.06, 0.0, 1.0),
+            expected_edge_pct=entry_edge,
+            min_expected_edge_pct=max(0.0, entry_edge * 0.88),
+            decision_score=score_now,
+            trade_score=score_now,
+        )
+        sym_key = f"{str(symbol or '').upper().strip()}|{rk}"
+        if sym_key and "|" in sym_key:
+            sym_state = self.symbol_regime_trade_feedback.get(sym_key, {})
+            self.symbol_regime_trade_feedback[sym_key] = {
+                "ema_pnl": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_pnl"), 0.0)) + (alpha * pnl_pct_net)),
+                "ema_win": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_win"), 0.5)) + (alpha * win_now)),
+                "count": float(_safe_float(sym_state.get("count"), 0.0) + 1.0),
+                "updated_ts": float(time.time()),
+            }
+
+    def _regime_trade_bias(self, regime: str) -> Dict[str, float]:
+        st = self.regime_trade_feedback.get(str(regime or "flat").strip().lower(), {})
+        count = _safe_float(st.get("count"), 0.0)
+        if count <= 0:
+            return {"edge_mult": 1.0, "time_mult": 1.0, "exit_bias": 0.0}
+        ema_pnl = _safe_float(st.get("ema_pnl"), 0.0)
+        ema_win = _safe_float(st.get("ema_win"), 0.5)
+        ema_exit_eff = _safe_float(st.get("ema_exit_efficiency"), 0.5)
+        confidence = _clamp(count / (18.0 if self.config.DRY_RUN else 12.0), 0.0, 1.0)
+        edge_mult = 1.0
+        time_mult = 1.0
+        exit_bias = 0.0
+        if ema_pnl < -0.0020 or ema_win < 0.42:
+            edge_mult += (0.07 * confidence)
+            time_mult -= (0.10 * confidence)
+            exit_bias += (0.10 * confidence)
+        elif ema_pnl > 0.0014 and ema_win > 0.56 and ema_exit_eff > 0.52:
+            edge_mult -= (0.05 * confidence)
+            time_mult += (0.08 * confidence)
+            exit_bias -= (0.05 * confidence)
+        return {
+            "edge_mult": float(_clamp(edge_mult, 0.88, 1.18)),
+            "time_mult": float(_clamp(time_mult, 0.82, 1.20)),
+            "exit_bias": float(_clamp(exit_bias, -0.08, 0.16)),
+        }
+
+    def _symbol_regime_trade_bias(self, symbol: str, regime: str) -> Dict[str, float]:
+        key = f"{str(symbol or '').upper().strip()}|{str(regime or 'flat').strip().lower()}"
+        st = self.symbol_regime_trade_feedback.get(key, {})
+        count = _safe_float(st.get("count"), 0.0)
+        recent_items = [
+            x for x in list(self.recent_cycle_feedback)[-24:]
+            if isinstance(x, dict)
+            and str(x.get("symbol", "")).strip().upper() == str(symbol or "").upper().strip()
+            and str(x.get("regime", "")).strip().lower() == str(regime or "flat").strip().lower()
+        ]
+        if count <= 0 and not recent_items:
+            return {"edge_delta": 0.0, "quality_delta": 0.0}
+        ema_pnl = _safe_float(st.get("ema_pnl"), 0.0)
+        ema_win = _safe_float(st.get("ema_win"), 0.5)
+        ema_decision = _safe_float(st.get("ema_decision"), 0.5)
+        confidence = _clamp(count / (10.0 if self.config.DRY_RUN else 7.0), 0.0, 1.0)
+        edge_delta = 0.0
+        quality_delta = 0.0
+        if ema_pnl < -0.0018 or ema_win < 0.40:
+            edge_delta += 0.00055 * confidence
+            quality_delta += 0.018 * confidence
+        elif ema_pnl > 0.0012 and ema_win > 0.58:
+            edge_delta -= 0.00040 * confidence
+            quality_delta -= 0.012 * confidence
+        if ema_decision < 0.44:
+            edge_delta += 0.00025 * max(0.35, confidence)
+            quality_delta += 0.010 * max(0.35, confidence)
+        elif ema_decision > 0.64:
+            edge_delta -= 0.00018 * max(0.35, confidence)
+            quality_delta -= 0.007 * max(0.35, confidence)
+        if recent_items:
+            recent_scores = [float(_safe_float(x.get("decision_score"), 0.5)) for x in recent_items]
+            recent_avg = float(sum(recent_scores) / max(1, len(recent_scores)))
+            if recent_avg < 0.40:
+                edge_delta += 0.00022
+                quality_delta += 0.008
+            elif recent_avg > 0.66:
+                edge_delta -= 0.00016
+                quality_delta -= 0.006
+        return {
+            "edge_delta": float(_clamp(edge_delta, -0.0010, 0.0012)),
+            "quality_delta": float(_clamp(quality_delta, -0.03, 0.04)),
+        }
+
+    def _symbol_regime_live_bias(self, symbol: str, regime: str) -> Dict[str, float]:
+        sym = str(symbol or "").upper().strip()
+        regime_key = str(regime or "flat").strip().lower()
+        quality_ema = _safe_float(self.symbol_quality_ema.get(sym, 0.0), 0.0)
+        streak = int(_safe_float(self.symbol_loss_streak.get(sym, 0.0), 0.0))
+        recent_items = [
+            x for x in list(self.recent_cycle_feedback)[-28:]
+            if isinstance(x, dict)
+            and str(x.get("symbol", "")).strip().upper() == sym
+            and str(x.get("regime", "")).strip().lower() == regime_key
+        ]
+        edge_delta = 0.0
+        quality_delta = 0.0
+        risk_mult = 1.0
+        debounce_delta = 0
+        if quality_ema <= -0.0018:
+            edge_delta += 0.00035
+            quality_delta += 0.010
+            risk_mult *= 0.90
+        elif quality_ema >= 0.0012:
+            edge_delta -= 0.00018
+            quality_delta -= 0.006
+            risk_mult *= 1.03
+        if streak >= 2:
+            edge_delta += min(0.0011, 0.00022 * streak)
+            quality_delta += min(0.035, 0.008 * streak)
+            risk_mult *= max(0.72, 1.0 - (0.08 * min(streak, 4)))
+            debounce_delta += 1
+        if recent_items:
+            recent_scores = [float(_safe_float(x.get("decision_score"), 0.5)) for x in recent_items]
+            recent_avg = float(sum(recent_scores) / max(1, len(recent_scores)))
+            if recent_avg < 0.38:
+                edge_delta += 0.00026
+                quality_delta += 0.010
+                risk_mult *= 0.92
+            elif recent_avg > 0.68 and streak <= 0:
+                edge_delta -= 0.00016
+                quality_delta -= 0.005
+                risk_mult *= 1.02
+        return {
+            "edge_delta": float(_clamp(edge_delta, -0.0008, 0.0014)),
+            "quality_delta": float(_clamp(quality_delta, -0.025, 0.045)),
+            "risk_mult": float(_clamp(risk_mult, 0.68, 1.06)),
+            "debounce_delta": int(max(0, min(2, debounce_delta))),
+        }
+
+    def _execution_profile_bias(self) -> Dict[str, float]:
+        api_errors = int(_safe_float(self.guard_state.get("consecutive_api_errors"), 0.0))
+        logic_errors = int(_safe_float(self.guard_state.get("consecutive_logic_errors"), 0.0))
+        slow_cycles = int(max(0, self._slow_cycle_streak))
+        slip_bps = max(0.0, _safe_float(self.exec_slippage_ema_bps, 0.0))
+        edge_delta = 0.0
+        quality_delta = 0.0
+        conf_delta = 0.0
+        risk_mult = 1.0
+        debounce_delta = 0
+        label = "normal"
+        if slip_bps >= 12.0:
+            edge_delta += 0.00040
+            quality_delta += 0.012
+            conf_delta += 0.008
+            risk_mult *= 0.84
+            debounce_delta += 1
+            label = "slippage_guard"
+        elif slip_bps >= 7.0:
+            edge_delta += 0.00022
+            quality_delta += 0.007
+            risk_mult *= 0.92
+            label = "slippage_watch"
+        if api_errors >= 2:
+            edge_delta += 0.00032
+            quality_delta += 0.010
+            conf_delta += 0.008
+            risk_mult *= 0.88
+            debounce_delta += 1
+            label = "api_unstable"
+        if logic_errors >= 2 or slow_cycles >= 2:
+            edge_delta += 0.00024
+            quality_delta += 0.008
+            conf_delta += 0.006
+            risk_mult *= 0.90
+            debounce_delta += 1
+            label = "runtime_degraded"
+        return {
+            "edge_delta": float(_clamp(edge_delta, 0.0, 0.0012)),
+            "quality_delta": float(_clamp(quality_delta, 0.0, 0.03)),
+            "conf_delta": float(_clamp(conf_delta, 0.0, 0.02)),
+            "risk_mult": float(_clamp(risk_mult, 0.70, 1.0)),
+            "debounce_delta": int(max(0, min(2, debounce_delta))),
+            "label": label,
+        }
+
+    def _symbol_execution_bias(self, symbol: str) -> Dict[str, float]:
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return {
+                "edge_delta": 0.0,
+                "risk_mult": 1.0,
+                "tp_mult": 1.0,
+                "ts_mult": 1.0,
+                "sl_mult": 1.0,
+                "label": "none",
+            }
+        slip_bps = max(0.0, _safe_float(self.symbol_exec_slippage_ema_bps.get(sym, 0.0), 0.0))
+        exec_quality = _clamp(_safe_float(self.symbol_exec_quality_ema.get(sym, 0.50), 0.50), 0.0, 1.0)
+        edge_delta = 0.0
+        risk_mult = 1.0
+        tp_mult = 1.0
+        ts_mult = 1.0
+        sl_mult = 1.0
+        label = "normal"
+        if slip_bps >= 10.0:
+            edge_delta += 0.00034
+            risk_mult *= 0.88
+            tp_mult *= 0.93
+            ts_mult *= 0.90
+            sl_mult *= 0.97
+            label = "symbol_slippage_guard"
+        elif slip_bps >= 6.0:
+            edge_delta += 0.00016
+            risk_mult *= 0.94
+            tp_mult *= 0.97
+            ts_mult *= 0.95
+            label = "symbol_slippage_watch"
+        if exec_quality <= 0.34:
+            edge_delta += 0.00030
+            risk_mult *= 0.86
+            tp_mult *= 0.92
+            ts_mult *= 0.88
+            sl_mult *= 0.96
+            label = "symbol_exec_degraded"
+        elif exec_quality >= 0.66 and slip_bps <= 4.0:
+            edge_delta -= 0.00012
+            risk_mult *= 1.04
+            tp_mult *= 1.02
+            ts_mult *= 1.01
+            label = "symbol_exec_clean"
+        return {
+            "edge_delta": float(_clamp(edge_delta, -0.0002, 0.0010)),
+            "risk_mult": float(_clamp(risk_mult, 0.76, 1.05)),
+            "tp_mult": float(_clamp(tp_mult, 0.88, 1.04)),
+            "ts_mult": float(_clamp(ts_mult, 0.84, 1.03)),
+            "sl_mult": float(_clamp(sl_mult, 0.94, 1.02)),
+            "label": label,
+            "slippage_bps": float(slip_bps),
+            "exec_quality": float(exec_quality),
+        }
+
+    def _update_shared_learning_feedback(
+        self,
+        *,
+        ai_quality: float,
+        ai_conf: float,
+        expected_edge_pct: float,
+        min_expected_edge_pct: float,
+        decision_score: float,
+        trade_score: Optional[float] = None,
+    ) -> None:
+        st = dict(self.shared_learning_feedback or {})
+        source_training = bool(self.config.DRY_RUN and self.config.AI_TRAINING_MODE)
+        alpha = 0.045 if source_training else 0.070
+        pass_now = 1.0 if expected_edge_pct >= min_expected_edge_pct else 0.0
+        edge_margin = float(expected_edge_pct - min_expected_edge_pct)
+        st["ema_pass"] = ((1.0 - alpha) * _safe_float(st.get("ema_pass"), 0.25)) + (alpha * pass_now)
+        st["ema_quality"] = ((1.0 - alpha) * _safe_float(st.get("ema_quality"), 0.50)) + (alpha * _clamp(ai_quality, 0.0, 1.0))
+        st["ema_conf"] = ((1.0 - alpha) * _safe_float(st.get("ema_conf"), 0.50)) + (alpha * _clamp(ai_conf, 0.0, 1.0))
+        st["ema_edge_margin"] = ((1.0 - alpha) * _safe_float(st.get("ema_edge_margin"), 0.0)) + (alpha * edge_margin)
+        st["ema_cycle_score"] = ((1.0 - alpha) * _safe_float(st.get("ema_cycle_score"), 0.50)) + (alpha * _clamp(decision_score, 0.0, 1.0))
+        if trade_score is not None:
+            st["ema_trade_score"] = ((1.0 - alpha) * _safe_float(st.get("ema_trade_score"), 0.50)) + (alpha * _clamp(trade_score, 0.0, 1.0))
+        if source_training:
+            st["training_weight"] = min(5000.0, _safe_float(st.get("training_weight"), 0.0) + 1.0)
+        else:
+            st["live_weight"] = min(5000.0, _safe_float(st.get("live_weight"), 0.0) + 1.0)
+        st["updated_ts"] = float(time.time())
+        self.shared_learning_feedback = st
+
+    def _shared_learning_bias(self) -> Dict[str, float]:
+        st = dict(self.shared_learning_feedback or {})
+        ema_pass = _clamp(_safe_float(st.get("ema_pass"), 0.25), 0.0, 1.0)
+        ema_quality = _clamp(_safe_float(st.get("ema_quality"), 0.50), 0.0, 1.0)
+        ema_conf = _clamp(_safe_float(st.get("ema_conf"), 0.50), 0.0, 1.0)
+        ema_edge_margin = _safe_float(st.get("ema_edge_margin"), 0.0)
+        ema_trade_score = _clamp(_safe_float(st.get("ema_trade_score"), 0.50), 0.0, 1.0)
+        ema_cycle_score = _clamp(_safe_float(st.get("ema_cycle_score"), 0.50), 0.0, 1.0)
+        training_weight = _safe_float(st.get("training_weight"), 0.0)
+        live_weight = _safe_float(st.get("live_weight"), 0.0)
+        combined_score = (ema_trade_score * 0.56) + (ema_cycle_score * 0.44)
+        live_dominant = live_weight >= max(8.0, training_weight * 0.20)
+        edge_delta = 0.0
+        quality_delta = 0.0
+        conf_delta = 0.0
+        if ema_pass <= 0.18 and combined_score <= 0.42:
+            edge_delta += 0.00022
+            quality_delta += 0.008
+            conf_delta += 0.007
+        elif ema_pass >= 0.44 and ema_edge_margin >= 0.0008 and combined_score >= 0.60:
+            edge_delta -= 0.00018
+            quality_delta -= 0.007
+            conf_delta -= 0.006
+        if ema_quality <= 0.42:
+            quality_delta += 0.006
+        elif ema_quality >= 0.64 and ema_conf >= 0.64:
+            quality_delta -= 0.004
+            conf_delta -= 0.004
+        if not live_dominant:
+            edge_delta *= 0.82
+            quality_delta *= 0.82
+            conf_delta *= 0.82
+        return {
+            "edge_delta": float(_clamp(edge_delta, -0.00035, 0.00045)),
+            "quality_delta": float(_clamp(quality_delta, -0.012, 0.016)),
+            "conf_delta": float(_clamp(conf_delta, -0.012, 0.016)),
+            "score": float(_clamp(combined_score, 0.0, 1.0)),
+            "label": ("live_weighted" if live_dominant else "training_seeded"),
+        }
+
+    def _execution_stress_mode(self) -> Dict[str, float]:
+        recent = list(self.recent_cycle_feedback)[-48:]
+        slow_cycles = int(max(0, self._slow_cycle_streak))
+        api_errors = int(_safe_float(self.guard_state.get("consecutive_api_errors"), 0.0))
+        logic_errors = int(_safe_float(self.guard_state.get("consecutive_logic_errors"), 0.0))
+        slip_bps = max(0.0, _safe_float(self.exec_slippage_ema_bps, 0.0))
+        if not recent and api_errors <= 0 and logic_errors <= 0 and slip_bps < 6.0:
+            return {"edge_delta": 0.0, "quality_delta": 0.0, "conf_delta": 0.0, "risk_mult": 1.0, "label": "normal", "score": 0.0}
+        total = float(max(1, len(recent)))
+        stale_rate = sum(1.0 for x in recent if bool(x.get("market_data_stale", False))) / total
+        blocked_rate = sum(1.0 for x in recent if str(x.get("event", "")).lower() in {"entry_blocked", "risk_guard_blocked", "cooldown"}) / total
+        decision_avg = sum(_safe_float(x.get("decision_score"), 0.5) for x in recent) / total
+        stress_score = 0.0
+        if stale_rate >= 0.16:
+            stress_score += 0.24
+        if blocked_rate >= 0.70:
+            stress_score += 0.22
+        if decision_avg <= 0.40:
+            stress_score += 0.18
+        if slow_cycles >= 2:
+            stress_score += 0.20
+        if api_errors >= 2:
+            stress_score += 0.22
+        if logic_errors >= 2:
+            stress_score += 0.18
+        if slip_bps >= 8.0:
+            stress_score += min(0.22, (slip_bps - 8.0) * 0.018)
+        stress_score = _clamp(stress_score, 0.0, 1.0)
+        if stress_score < 0.22:
+            return {"edge_delta": 0.0, "quality_delta": 0.0, "conf_delta": 0.0, "risk_mult": 1.0, "label": "normal", "score": float(stress_score)}
+        return {
+            "edge_delta": float(_clamp(stress_score * 0.0010, 0.0, 0.0012)),
+            "quality_delta": float(_clamp(stress_score * 0.020, 0.0, 0.022)),
+            "conf_delta": float(_clamp(stress_score * 0.016, 0.0, 0.018)),
+            "risk_mult": float(_clamp(1.0 - (stress_score * 0.22), 0.74, 1.0)),
+            "label": ("stress_guard" if stress_score >= 0.50 else "stress_watch"),
+            "score": float(stress_score),
+        }
+
+    def _adaptive_symbol_market_cooldown(self, symbol: str, regime: str = "") -> Dict[str, float]:
+        sym = str(symbol or "").upper().strip()
+        regime_key = str(regime or "").strip().lower()
+        if not sym:
+            return {"seconds": 0.0, "label": "none", "score": 0.0}
+        items = [
+            x for x in list(self.recent_cycle_feedback)[-28:]
+            if isinstance(x, dict) and str(x.get("symbol", "")).strip().upper() == sym
+        ]
+        if regime_key:
+            regime_items = [x for x in items if str(x.get("regime", "")).strip().lower() == regime_key]
+            if len(regime_items) >= 6:
+                items = regime_items
+        if len(items) < 6:
+            return {"seconds": 0.0, "label": "none", "score": 0.0}
+        total = float(len(items))
+        blocked = sum(1.0 for x in items if str(x.get("event", "")).lower() in {"entry_blocked", "risk_guard_blocked", "cooldown"})
+        trades = sum(1.0 for x in items if str(x.get("event", "")).lower() in {"buy", "sell", "training_buy_signal", "training_sell_signal", "partial_sell"})
+        stale = sum(1.0 for x in items if bool(x.get("market_data_stale", False)))
+        no_trade = sum(1.0 for x in items if str(x.get("event", "")).lower() in {"no_trade_signal", "training_no_signal"})
+        decision_avg = float(sum(_safe_float(x.get("decision_score"), 0.5) for x in items) / max(1.0, total))
+        blocked_rate = blocked / total
+        stale_rate = stale / total
+        no_trade_rate = no_trade / total
+        trade_rate = trades / total
+        loss_streak = int(_safe_float(self.symbol_loss_streak.get(sym, 0.0), 0.0))
+        exec_bias = self._symbol_execution_bias(sym)
+        weak_exec = (
+            _safe_float(exec_bias.get("exec_quality"), 0.5) <= 0.36
+            or _safe_float(exec_bias.get("slippage_bps"), 0.0) >= 8.0
+        )
+        seconds = 0.0
+        score = 0.0
+        label = "none"
+        if blocked_rate >= 0.74 and decision_avg <= 0.42 and trade_rate <= 0.12:
+            seconds += 35.0
+            score += 0.38
+            label = "blocked_window"
+        if no_trade_rate >= 0.82 and decision_avg <= 0.40:
+            seconds += 18.0
+            score += 0.22
+            label = "dead_window"
+        if stale_rate >= 0.18:
+            seconds += 14.0
+            score += 0.14
+            label = "stale_window"
+        if loss_streak >= 2:
+            seconds += min(45.0, 10.0 + (loss_streak * 7.0))
+            score += 0.18
+            label = "loss_streak_window"
+        if weak_exec:
+            seconds += 18.0
+            score += 0.16
+            label = "execution_window"
+        if regime_key in {"flat", "range"} and decision_avg <= 0.36:
+            seconds += 12.0
+            score += 0.10
+        if self.config.DRY_RUN and self.config.AI_TRAINING_MODE:
+            seconds *= 0.55
+        return {
+            "seconds": float(_clamp(seconds, 0.0, 90.0)),
+            "label": label,
+            "score": float(_clamp(score, 0.0, 1.0)),
+        }
+
+    def _score_cycle_decision(
+        self,
+        *,
+        event: str,
+        buy_block_reasons: list[str],
+        ai_quality: float,
+        ai_conf: float,
+        expected_edge_pct: float,
+        min_expected_edge_pct: float,
+        market_data_stale: bool,
+    ) -> float:
+        evt = str(event or "").strip().lower()
+        reasons = [str(x or "").strip().lower() for x in buy_block_reasons if str(x or "").strip()]
+        quality = float(_clamp(ai_quality, 0.0, 1.0))
+        conf = float(_clamp(ai_conf, 0.0, 1.0))
+        edge_ratio = 0.0
+        if min_expected_edge_pct > 0:
+            edge_ratio = float(_clamp(expected_edge_pct / max(1e-9, min_expected_edge_pct), -2.0, 2.0))
+        if market_data_stale or evt == "market_data_unavailable":
+            return 0.10
+        if evt in {"buy", "training_buy_signal"}:
+            return float(_clamp(0.50 + (quality * 0.22) + (conf * 0.18) + (max(0.0, edge_ratio) * 0.10), 0.0, 1.0))
+        if evt in {"sell", "training_sell_signal", "partial_sell"}:
+            return float(_clamp(0.56 + (quality * 0.12) + (max(0.0, edge_ratio) * 0.08), 0.0, 1.0))
+        if evt == "risk_guard_blocked":
+            return 0.52
+        if evt == "entry_blocked":
+            score = 0.48
+            if any("expected_edge" in r or "edge" in r for r in reasons):
+                score += 0.20 if expected_edge_pct < min_expected_edge_pct else 0.08
+            if any("quality" in r for r in reasons):
+                score += 0.16 if quality < 0.55 else 0.06
+            if any("confidence" in r or "conf" in r for r in reasons):
+                score += 0.10 if conf < 0.55 else 0.04
+            return float(_clamp(score, 0.0, 1.0))
+        if evt in {"no_trade_signal", "training_no_signal"}:
+            if expected_edge_pct < min_expected_edge_pct or quality < 0.45:
+                return float(_clamp(0.58 + (quality * 0.06), 0.0, 1.0))
+            return 0.42
+        if evt == "cooldown":
+            return 0.55
+        return 0.45
+
+    def _update_cycle_feedback(
+        self,
+        *,
+        symbol: str,
+        regime: str,
+        event: str,
+        buy_block_reasons: list[str],
+        ai_quality: float,
+        ai_conf: float,
+        expected_edge_pct: float,
+        min_expected_edge_pct: float,
+        market_data_stale: bool,
+    ) -> None:
+        decision_score = self._score_cycle_decision(
+            event=event,
+            buy_block_reasons=buy_block_reasons,
+            ai_quality=ai_quality,
+            ai_conf=ai_conf,
+            expected_edge_pct=expected_edge_pct,
+            min_expected_edge_pct=min_expected_edge_pct,
+            market_data_stale=market_data_stale,
+        )
+        item = {
+            "symbol": str(symbol or "").upper().strip(),
+            "regime": str(regime or "flat").strip().lower(),
+            "event": str(event or "").strip().lower(),
+            "buy_block_reasons": [str(x or "").strip().lower() for x in buy_block_reasons if str(x or "").strip()],
+            "ai_quality": float(_clamp(ai_quality, 0.0, 1.0)),
+            "ai_conf": float(_clamp(ai_conf, 0.0, 1.0)),
+            "expected_edge_pct": float(expected_edge_pct),
+            "min_expected_edge_pct": float(min_expected_edge_pct),
+            "market_data_stale": bool(market_data_stale),
+            "decision_score": float(decision_score),
+            "ts": float(time.time()),
+        }
+        self.recent_cycle_feedback.append(item)
+        self.recent_decision_scores.append(float(decision_score))
+        self._update_shared_learning_feedback(
+            ai_quality=ai_quality,
+            ai_conf=ai_conf,
+            expected_edge_pct=expected_edge_pct,
+            min_expected_edge_pct=min_expected_edge_pct,
+            decision_score=decision_score,
+        )
+        sym_key = f"{str(symbol or '').upper().strip()}|{str(regime or 'flat').strip().lower()}"
+        if sym_key and "|" in sym_key:
+            sym_state = self.symbol_regime_trade_feedback.get(sym_key, {})
+            alpha = 0.18 if self.config.DRY_RUN else 0.14
+            self.symbol_regime_trade_feedback[sym_key] = {
+                "ema_pnl": float(_safe_float(sym_state.get("ema_pnl"), 0.0)),
+                "ema_win": float(_safe_float(sym_state.get("ema_win"), 0.5)),
+                "ema_decision": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_decision"), 0.5)) + (alpha * decision_score)),
+                "count": float(max(_safe_float(sym_state.get("count"), 0.0), 0.0)),
+                "updated_ts": float(time.time()),
+            }
+
+    def _cycle_adaptive_bias(self, symbol: str, regime: str) -> Dict[str, float]:
+        regime_key = str(regime or "flat").strip().lower()
+        symbol_key = str(symbol or "").upper().strip()
+        if not self.recent_cycle_feedback:
+            return {"edge_delta": 0.0, "quality_delta": 0.0, "conf_delta": 0.0, "debounce_delta": 0}
+        items = [
+            x for x in self.recent_cycle_feedback
+            if isinstance(x, dict)
+            and str(x.get("regime", "")).strip().lower() == regime_key
+            and (not symbol_key or str(x.get("symbol", "")).strip().upper() == symbol_key)
+        ]
+        if len(items) < 8:
+            items = [
+                x for x in self.recent_cycle_feedback
+                if isinstance(x, dict) and str(x.get("regime", "")).strip().lower() == regime_key
+            ]
+        if not items:
+            return {"edge_delta": 0.0, "quality_delta": 0.0, "conf_delta": 0.0, "debounce_delta": 0}
+        total = float(len(items))
+        blocked = sum(1.0 for x in items if str(x.get("event", "")).lower() in {"entry_blocked", "risk_guard_blocked"})
+        market_unavail = sum(1.0 for x in items if str(x.get("event", "")).lower() == "market_data_unavailable")
+        weak_edge = sum(1.0 for x in items if any("expected_edge" in r or "edge" in r for r in x.get("buy_block_reasons", [])))
+        weak_quality = sum(1.0 for x in items if any("quality" in r for r in x.get("buy_block_reasons", [])))
+        stale = sum(1.0 for x in items if bool(x.get("market_data_stale", False)))
+        trades = sum(1.0 for x in items if str(x.get("event", "")).lower() in {"buy", "sell", "training_buy_signal", "training_sell_signal", "partial_sell"})
+        blocked_rate = blocked / total
+        market_bad_rate = (market_unavail + stale) / total
+        trade_rate = trades / total
+        edge_delta = 0.0
+        quality_delta = 0.0
+        conf_delta = 0.0
+        debounce_delta = 0
+        if market_bad_rate >= 0.28:
+            debounce_delta += 1
+            conf_delta += 0.01
+        if blocked_rate >= 0.72 and trade_rate < 0.08:
+            if weak_edge >= weak_quality:
+                edge_delta -= 0.00035
+            else:
+                quality_delta -= 0.010
+                conf_delta -= 0.008
+        elif blocked_rate <= 0.35 and trade_rate >= 0.10:
+            edge_delta += 0.00010
+        return {
+            "edge_delta": float(_clamp(edge_delta, -0.0008, 0.0004)),
+            "quality_delta": float(_clamp(quality_delta, -0.02, 0.015)),
+            "conf_delta": float(_clamp(conf_delta, -0.02, 0.015)),
+            "debounce_delta": int(max(-1, min(2, debounce_delta))),
+        }
+
+    def _refresh_confirmed_exchange_state(self, symbol: str, price_hint: float = 0.0) -> None:
+        if self.config.DRY_RUN:
+            return
+        try:
+            pos = self.trader.get_position(symbol)
+        except Exception as exc:
+            logging.info("Post-trade sync skipped for %s: %s", symbol, exc)
+            return
+        exchange_usdt_free = max(0.0, _safe_float(pos.get("usdt_free"), 0.0))
+        exchange_base_free = max(0.0, _safe_float(pos.get("base_free"), 0.0))
+        balance_source = str(pos.get("balance_source", "unknown") or "unknown").strip().lower()
+        px = max(0.0, _safe_float(price_hint, 0.0))
+        if px <= 0:
+            try:
+                px = max(0.0, _safe_float(self.trader.last_price(symbol, force_refresh=True), 0.0))
+            except Exception:
+                px = 0.0
+        equity_usdt = exchange_usdt_free + (exchange_base_free * px if px > 0 else 0.0)
+        if balance_source in {"exchange", "cache_exchange"}:
+            self._last_confirmed_exchange_usdt_free = exchange_usdt_free
+            self._last_confirmed_exchange_equity_usdt = max(0.0, equity_usdt)
+            self._last_confirmed_exchange_balance_source = balance_source
 
     def _loss_streak_risk_scale(self) -> float:
         if self.loss_streak_live <= 0:
@@ -4318,7 +5242,13 @@ class Bot:
             conf_base = ai_signal.calibrated_confidence if ai_signal.calibrated_confidence > 0 else ai_signal.confidence
             conf = _clamp(conf_base, 0.0, 1.0)
         strength_boost = _lerp(0.9, 1.25, conf)
-        dynamic = int(base * vol_scale * strength_boost)
+        regime = str(self.runtime_market_ctx.get("regime", "flat") or "flat").lower().strip()
+        bias = self._regime_trade_bias(regime)
+        quality = self._quality_for_entry(ai_signal)
+        quality_mult = _lerp(0.90, 1.18, quality)
+        if regime in {"flat", "range"}:
+            quality_mult *= 0.94
+        dynamic = int(base * vol_scale * strength_boost * quality_mult * _safe_float(bias.get("time_mult"), 1.0))
         return int(_clamp(dynamic, min_c, max_c))
 
     def _apply_open_position_tp_adaptation(
@@ -4388,6 +5318,11 @@ class Bot:
         # Stronger weakness -> stronger TP squeeze and tighter trailing.
         tp_mult = _lerp(0.90, 0.42, weak_score)
         ts_mult = _lerp(0.96, 0.68, weak_score)  # smaller trailing pct = tighter protection
+        symbol_exec_bias = self._symbol_execution_bias(symbol)
+        if _safe_float(symbol_exec_bias.get("risk_mult"), 1.0) < 0.995:
+            tp_mult *= _safe_float(symbol_exec_bias.get("tp_mult"), 1.0)
+            ts_mult *= _safe_float(symbol_exec_bias.get("ts_mult"), 1.0)
+            reasons.append(str(symbol_exec_bias.get("label", "exec_bias")))
 
         # Tiny balance mode: bring TP closer to real reachable range.
         eq = max(0.0, _safe_float(cycle_equity_usdt, 0.0))
@@ -4439,6 +5374,7 @@ class Bot:
             "symbol": symbol,
             "tiny_balance_score": round(float(tiny_balance_score), 4),
             "cycle_equity_usdt": float(eq),
+            "symbol_exec_bias": dict(symbol_exec_bias),
         }
         return risk, out
 
@@ -4549,7 +5485,7 @@ class Bot:
         conf_base = ai_signal.calibrated_confidence if ai_signal.calibrated_confidence > 0 else ai_signal.confidence
         return _clamp(conf_base, 0.0, 1.0)
 
-    def _get_active_risk_profile(self, ai_signal: Optional[AISignal], ohlcv: list[list[float]]) -> dict:
+    def _get_active_risk_profile(self, symbol: str, ai_signal: Optional[AISignal], ohlcv: list[list[float]]) -> dict:
         risk_profile = {
             "fraction": self.config.SPOT_BALANCE_RISK_FRACTION,
             "stop_loss": self.config.SPOT_STOP_LOSS_PCT,
@@ -4618,6 +5554,70 @@ class Bot:
                 min(self.config.AI_TAKE_PROFIT_MAX, risk_profile["stop_loss"] * min_rr),
             )
 
+        execution_profile = self._execution_profile_bias()
+        symbol_exec_bias = self._symbol_execution_bias(symbol)
+        regime = str(self.runtime_market_ctx.get("regime", "flat") or "flat").lower().strip()
+        flags_raw = self.runtime_market_ctx.get("flags", [])
+        flags = {str(x).lower().strip() for x in flags_raw} if isinstance(flags_raw, list) else set()
+        if _safe_float(execution_profile.get("risk_mult"), 1.0) < 0.999:
+            risk_profile["fraction"] = max(
+                self.config.AI_RISK_FRACTION_MIN,
+                risk_profile["fraction"] * _safe_float(execution_profile.get("risk_mult"), 1.0),
+            )
+            if _safe_float(execution_profile.get("edge_delta"), 0.0) >= 0.0003:
+                risk_profile["take_profit"] = max(
+                    self.config.AI_TAKE_PROFIT_MIN,
+                    risk_profile["take_profit"] * 0.92,
+                )
+                risk_profile["trailing_stop"] = max(
+                    self.config.AI_TRAILING_STOP_MIN,
+                    risk_profile["trailing_stop"] * 0.88,
+                )
+                risk_profile["stop_loss"] = max(
+                    self.config.AI_STOP_LOSS_MIN,
+                    min(self.config.AI_STOP_LOSS_MAX, risk_profile["stop_loss"] * 0.96),
+                )
+        if _safe_float(symbol_exec_bias.get("risk_mult"), 1.0) < 0.999 or _safe_float(symbol_exec_bias.get("edge_delta"), 0.0) > 0:
+            risk_profile["fraction"] = max(
+                self.config.AI_RISK_FRACTION_MIN,
+                risk_profile["fraction"] * _safe_float(symbol_exec_bias.get("risk_mult"), 1.0),
+            )
+            risk_profile["take_profit"] = max(
+                self.config.AI_TAKE_PROFIT_MIN,
+                risk_profile["take_profit"] * _safe_float(symbol_exec_bias.get("tp_mult"), 1.0),
+            )
+            risk_profile["trailing_stop"] = max(
+                self.config.AI_TRAILING_STOP_MIN,
+                risk_profile["trailing_stop"] * _safe_float(symbol_exec_bias.get("ts_mult"), 1.0),
+            )
+            risk_profile["stop_loss"] = max(
+                self.config.AI_STOP_LOSS_MIN,
+                min(
+                    self.config.AI_STOP_LOSS_MAX,
+                    risk_profile["stop_loss"] * _safe_float(symbol_exec_bias.get("sl_mult"), 1.0),
+                ),
+            )
+        if regime in {"flat", "range"} and ("low_vol" in flags or "low_volatility" in flags):
+            risk_profile["take_profit"] = max(
+                self.config.AI_TAKE_PROFIT_MIN,
+                risk_profile["take_profit"] * 0.96,
+            )
+        risk_profile["stop_loss"] = _clamp(
+            risk_profile["stop_loss"],
+            self.config.AI_STOP_LOSS_MIN,
+            self.config.AI_STOP_LOSS_MAX,
+        )
+        risk_profile["take_profit"] = _clamp(
+            risk_profile["take_profit"],
+            self.config.AI_TAKE_PROFIT_MIN,
+            self.config.AI_TAKE_PROFIT_MAX,
+        )
+        risk_profile["trailing_stop"] = _clamp(
+            risk_profile["trailing_stop"],
+            self.config.AI_TRAILING_STOP_MIN,
+            self.config.AI_TRAILING_STOP_MAX,
+        )
+
         return risk_profile
 
     @staticmethod
@@ -4672,6 +5672,7 @@ class Bot:
         )
         weak_market = flat_like or hold_ratio >= 0.95
         weak_signal = weak_quality or ai_short_bias
+        regime_bias = self._regime_trade_bias(regime)
 
         sl_pct = max(0.0, _safe_float(active_risk.get("stop_loss"), 0.0))
         factor = 0.16
@@ -4683,8 +5684,13 @@ class Bot:
             factor += 0.04
         if hold_ratio >= 1.00:
             factor += 0.05
+        factor += max(0.0, _safe_float(regime_bias.get("exit_bias"), 0.0)) * 0.20
         max_cap = max(0.0018, sl_pct * 0.45)
         loss_limit = _clamp(sl_pct * factor, 0.0010, max_cap)
+        if flat_like and quality >= max(0.52, soft_quality + 0.04):
+            loss_limit = min(max_cap, loss_limit * 1.12)
+        if _safe_float(regime_bias.get("exit_bias"), 0.0) >= 0.08:
+            stalled_from_peak = stalled_from_peak or (candles_since_peak >= max(3, self.config.POSITION_STALL_CANDLES // 3))
 
         should_exit = bool(
             pnl < 0
@@ -4947,6 +5953,175 @@ class Bot:
             str(reason or "loss_streak"),
         )
 
+    def _pretrade_execution_guard(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        notional_usdt: float,
+        price_hint: float,
+        ai_quality: float,
+        expected_edge_pct: float,
+    ) -> tuple[bool, str]:
+        sym = str(symbol or "").upper().strip()
+        trade_side = str(side or "buy").strip().lower()
+        if not sym:
+            return False, "invalid_symbol"
+        px = max(0.0, _safe_float(price_hint, 0.0))
+        try:
+            live_px = max(0.0, _safe_float(self.trader.last_price(sym, force_refresh=True), 0.0))
+        except Exception:
+            live_px = 0.0
+        if live_px > 0:
+            px = live_px
+        if px <= 0:
+            return False, "market_data_unavailable"
+        if trade_side == "buy":
+            min_cost = max(0.0, _safe_float(self.trader.market_min_cost(sym), 0.0))
+            if min_cost > 0 and notional_usdt < (min_cost * 1.01):
+                return False, "below_min_notional"
+            if not self.config.DRY_RUN:
+                try:
+                    pos = self.trader.get_position(sym)
+                    usdt_free = max(0.0, _safe_float(pos.get("usdt_free"), 0.0))
+                    if usdt_free > 0 and notional_usdt > (usdt_free * 1.02):
+                        return False, "balance_changed"
+                except Exception:
+                    pass
+        regime = str(self.runtime_market_ctx.get("regime", "flat") or "flat").lower().strip()
+        bias = self._regime_trade_bias(regime)
+        if trade_side == "buy":
+            if expected_edge_pct <= 0 and ai_quality < 0.60:
+                return False, "weak_edge_quality_combo"
+            if _safe_float(bias.get("exit_bias"), 0.0) >= 0.12 and expected_edge_pct < 0.0022:
+                return False, "regime_degraded_for_entries"
+        return True, ""
+
+    def _runtime_degradation_recover(self, *, event: str, symbol: str, market_data_stale: bool) -> Dict[str, object]:
+        event_norm = str(event or "").strip().lower()
+        out = {
+            "triggered": False,
+            "action": "",
+            "reason": "",
+        }
+        cycle_errors = int(_safe_float(self.guard_state.get("consecutive_cycle_errors"), 0.0))
+        logic_errors = int(_safe_float(self.guard_state.get("consecutive_logic_errors"), 0.0))
+        api_errors = int(_safe_float(self.guard_state.get("consecutive_api_errors"), 0.0))
+        should_reset_symbol = False
+        if market_data_stale and (cycle_errors >= 2 or api_errors >= 2):
+            should_reset_symbol = True
+            out["reason"] = "stale_market_data"
+        elif event_norm == "market_data_unavailable" and cycle_errors >= 2:
+            should_reset_symbol = True
+            out["reason"] = "repeated_market_data_unavailable"
+        elif event_norm in {"entry_blocked", "risk_guard_blocked"} and logic_errors >= max(3, int(self.config.MAX_CYCLE_ERRORS)):
+            should_reset_symbol = True
+            out["reason"] = "repeated_entry_degradation"
+        if should_reset_symbol and self.config.AUTO_SYMBOL_SELECTION and not self._last_has_open_position:
+            self.active_symbol = None
+            self._last_symbol_scan_ts = 0.0
+            out["triggered"] = True
+            out["action"] = "symbol_rescan"
+        return out
+
+    def _cycle_runtime_watchdog(self, *, cycle_index: int, cycle_elapsed_sec: float, last_event: str) -> Dict[str, object]:
+        out = {
+            "triggered": False,
+            "action": "",
+            "reason": "",
+            "event": str(last_event or ""),
+        }
+        threshold_sec = max(
+            18.0,
+            float(self._next_cycle_sleep_seconds()) * 4.0,
+            float(self.config.CYCLE_IO_TIMEOUT_SEC) * 4.0,
+            float(self.config.ORDER_CONFIRM_TOTAL_TIMEOUT_SEC) * 2.2,
+        )
+        if cycle_elapsed_sec <= threshold_sec:
+            self._slow_cycle_streak = max(0, int(self._slow_cycle_streak) - 1)
+            return out
+        self._slow_cycle_streak = min(12, int(self._slow_cycle_streak) + 1)
+        if self._slow_cycle_streak < 2:
+            return out
+        now_ts = time.time()
+        has_open_position = bool(getattr(self, "_last_has_open_position", False))
+        event_norm = str(last_event or "").strip().lower()
+        if has_open_position and self.active_symbol:
+            self._refresh_confirmed_exchange_state(self.active_symbol)
+            action = "position_resync"
+            reason = "slow_cycle_with_open_position"
+        else:
+            self.active_symbol = None
+            self._last_symbol_scan_ts = 0.0
+            self._cycle_compute_cache.clear()
+            self.current_cycle_trade_meta.clear()
+            action = "soft_runtime_reset"
+            reason = "slow_cycle_degraded"
+        event_sig = f"{action}:{event_norm}:{int(cycle_elapsed_sec)}"
+        should_emit = (
+            event_sig != self._last_cycle_watchdog_event
+            or (now_ts - float(self._last_cycle_watchdog_log_ts)) >= 45.0
+        )
+        self._last_cycle_watchdog_event = event_sig
+        self._last_cycle_watchdog_log_ts = now_ts
+        if not should_emit:
+            return out
+        out["triggered"] = True
+        out["action"] = action
+        out["reason"] = f"{reason}:streak={int(self._slow_cycle_streak)}:threshold={threshold_sec:.1f}s"
+        if event_norm == "cycle_busy":
+            out["reason"] += ":busy"
+        return out
+
+    def _reconcile_post_order_position(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        pre_base_free: float,
+        requested_base: float,
+        quote_amount: float,
+        executed_price: float,
+    ) -> Dict[str, float]:
+        out = {
+            "confirmed_qty": 0.0,
+            "confirmed_quote": max(0.0, _safe_float(quote_amount, 0.0)),
+            "confirmed_price": max(0.0, _safe_float(executed_price, 0.0)),
+            "post_base_free": max(0.0, _safe_float(pre_base_free, 0.0)),
+        }
+        if self.config.DRY_RUN:
+            return out
+        side_norm = str(side or "").strip().lower()
+        if side_norm not in {"buy", "sell"}:
+            return out
+        try:
+            pos = self.trader.get_position(symbol)
+        except Exception as exc:
+            self.trader._record_api_error(f"post_order_reconcile_{side_norm}", exc)
+            return out
+        post_base = max(0.0, _safe_float(pos.get("base_free"), pre_base_free))
+        out["post_base_free"] = post_base
+        if side_norm == "buy":
+            confirmed_qty = max(0.0, post_base - max(0.0, _safe_float(pre_base_free, 0.0)))
+        else:
+            confirmed_qty = max(0.0, max(0.0, _safe_float(pre_base_free, 0.0)) - post_base)
+        if confirmed_qty <= 0 and side_norm == "buy":
+            confirmed_qty = max(0.0, _safe_float(requested_base, 0.0))
+        out["confirmed_qty"] = confirmed_qty
+        price_ref = max(0.0, _safe_float(executed_price, 0.0))
+        if price_ref <= 0:
+            try:
+                price_ref = max(0.0, _safe_float(self.trader.last_price(symbol, force_refresh=True), 0.0))
+            except Exception:
+                price_ref = 0.0
+        if confirmed_qty > 0:
+            if out["confirmed_quote"] <= 0 and price_ref > 0:
+                out["confirmed_quote"] = confirmed_qty * price_ref
+            if price_ref <= 0 and out["confirmed_quote"] > 0:
+                price_ref = out["confirmed_quote"] / max(1e-12, confirmed_qty)
+        out["confirmed_price"] = max(0.0, price_ref)
+        return out
+
     def _mark_closed_trade_outcome(self, symbol: str, reason: str, pnl_net_pct: float, side: str = "LONG") -> None:
         sym = str(symbol or "").upper().strip()
         if not sym:
@@ -4965,12 +6140,22 @@ class Bot:
         else:
             self.side_stoploss_streak[side_norm] = max(0, int(self.side_stoploss_streak.get(side_norm, 0)) - 1)
 
+        regime = str(self.runtime_market_ctx.get("regime", "flat") or "flat").lower().strip()
+        regime_bias = self._regime_trade_bias(regime)
+        if pnl_net_pct < 0 and _safe_float(regime_bias.get("exit_bias"), 0.0) >= 0.10:
+            self.symbol_loss_streak[sym] = min(12, int(self.symbol_loss_streak.get(sym, 0)) + 1)
+
         max_pair_streak = max(2, int(self.config.PAIR_QUARANTINE_LOSS_STREAK))
         if int(self.symbol_loss_streak.get(sym, 0)) >= max_pair_streak:
+            extra_minutes = 0
+            if pnl_net_pct < 0 and close_reason in {"stop_loss", "smart_stagnation_exit", "stall_exit", "ai_quality_fade"}:
+                extra_minutes += 8
+            if _safe_float(regime_bias.get("exit_bias"), 0.0) >= 0.10:
+                extra_minutes += 6
             self._set_symbol_quarantine(
                 sym,
-                max(10, int(self.config.PAIR_QUARANTINE_MINUTES)),
-                reason=f"loss_streak_{int(self.symbol_loss_streak.get(sym, 0))}",
+                max(10, int(self.config.PAIR_QUARANTINE_MINUTES) + extra_minutes),
+                reason=f"loss_streak_{int(self.symbol_loss_streak.get(sym, 0))}:{regime}",
             )
             # Keep counter below trigger to avoid re-trigger every close event.
             self.symbol_loss_streak[sym] = max_pair_streak - 1
@@ -5151,6 +6336,15 @@ class Bot:
                     candle_ref_price,
                     refs_drift_bps,
                 )
+                if self.config.AI_TRAINING_MODE and self.config.DRY_RUN:
+                    # In paper mode, a large ticker/candle desync may corrupt virtual balance accounting.
+                    logging.warning(
+                        "[TRADE] BUY_BLOCKED | symbol=%s | reason=paper_price_desync | drift=%.2f bps",
+                        symbol,
+                        refs_drift_bps,
+                    )
+                    self._register_api_soft_guard_if_needed("paper_price_desync:buy")
+                    return False
                 live_ref_price = candle_ref_price
         if live_ref_price <= 0 and candle_ref_price > 0:
             live_ref_price = candle_ref_price
@@ -5184,24 +6378,6 @@ class Bot:
         confirmed_delta_base = 0.0
 
         if self.config.AI_TRAINING_MODE and self.config.DRY_RUN:
-            # In paper mode, enforce symbol-scoped fresh price to avoid cross-symbol contamination.
-            try:
-                paper_ref_price = _safe_float(self.trader.last_price(symbol, force_refresh=True), 0.0)
-            except Exception:
-                paper_ref_price = 0.0
-            if paper_ref_price > 0 and _safe_float(price, 0.0) > 0:
-                paper_drift_bps = abs((_safe_float(price, 0.0) / paper_ref_price) - 1.0) * 10_000.0
-                if paper_drift_bps > 1200.0:
-                    logging.warning(
-                        "[TRADE] PAPER_PRICE_RESYNC | symbol=%s | stale_price=%.6f | live_price=%.6f | drift=%.2f bps",
-                        symbol,
-                        _safe_float(price, 0.0),
-                        paper_ref_price,
-                        paper_drift_bps,
-                    )
-                    price = paper_ref_price
-            elif _safe_float(price, 0.0) <= 0 and paper_ref_price > 0:
-                price = paper_ref_price
             usdt_before = _safe_float(self.paper_usdt_free, 0.0)
             usdt_spent = min(usdt_cost, usdt_before)
             if usdt_spent <= 0 or price <= 0:
@@ -5270,6 +6446,26 @@ class Bot:
                     )
                     self._register_api_soft_guard_if_needed("order_confirm_timeout:buy")
                     return False
+                reconcile = self._reconcile_post_order_position(
+                    symbol=symbol,
+                    side="buy",
+                    pre_base_free=pre_base_free,
+                    requested_base=base_amount if base_amount > 0 else (quote_amount / max(1e-12, price)),
+                    quote_amount=quote_amount,
+                    executed_price=executed_price,
+                )
+                reconciled_qty = max(0.0, _safe_float(reconcile.get("confirmed_qty"), 0.0))
+                reconciled_quote = max(0.0, _safe_float(reconcile.get("confirmed_quote"), 0.0))
+                reconciled_price = max(0.0, _safe_float(reconcile.get("confirmed_price"), 0.0))
+                if reconciled_qty > 0:
+                    base_amount = reconciled_qty
+                if reconciled_quote > 0:
+                    if quote_amount <= 0:
+                        quote_amount = reconciled_quote
+                    elif abs((reconciled_quote / max(1e-12, quote_amount)) - 1.0) > 0.35:
+                        quote_amount = reconciled_quote
+                if reconciled_price > 0:
+                    executed_price = reconciled_price
                 if executed_price <= 0:
                     executed_price = self.trader.last_price(symbol, force_refresh=True)
                 # Sanity guard for malformed fill prices from exchange/gateway.
@@ -5373,6 +6569,7 @@ class Bot:
                 "runtime_params": cycle_meta.get("runtime_params", {}),
                 "active_risk": cycle_meta.get("active_risk", dict(active_risk)),
             }
+            self._refresh_confirmed_exchange_state(symbol, executed_price)
         self.last_trade_ts = time.time()
         return True
 
@@ -5500,6 +6697,26 @@ class Bot:
                     sold_confirmed = max(0.0, pre_base_free - post_base)
                     if sold_confirmed > 0 and sold_confirmed < base_amount:
                         base_amount = sold_confirmed
+                reconcile = self._reconcile_post_order_position(
+                    symbol=symbol,
+                    side="sell",
+                    pre_base_free=pre_base_free,
+                    requested_base=base_amount,
+                    quote_amount=quote_amount,
+                    executed_price=price,
+                )
+                reconciled_qty = max(0.0, _safe_float(reconcile.get("confirmed_qty"), 0.0))
+                reconciled_quote = max(0.0, _safe_float(reconcile.get("confirmed_quote"), 0.0))
+                reconciled_price = max(0.0, _safe_float(reconcile.get("confirmed_price"), 0.0))
+                if reconciled_qty > 0:
+                    base_amount = reconciled_qty
+                if reconciled_quote > 0:
+                    if quote_amount <= 0:
+                        quote_amount = reconciled_quote
+                    elif abs((reconciled_quote / max(1e-12, quote_amount)) - 1.0) > 0.35:
+                        quote_amount = reconciled_quote
+                if reconciled_price > 0:
+                    price = reconciled_price
                 self.active_symbol = None
             except Exception as exc:
                 logging.warning("SELL execution failed for %s: %s", symbol, exc)
@@ -5578,6 +6795,15 @@ class Bot:
                     "quote_amount": quote_amount,
                     "base_amount": base_amount,
                 }
+                self._update_regime_trade_feedback(
+                    symbol=symbol,
+                    regime=regime,
+                    pnl_pct_net=pnl_pct_net,
+                    entry_quality=_safe_float(entry_meta.get("entry_quality"), 0.0),
+                    entry_edge=_safe_float(entry_meta.get("expected_edge_pct"), 0.0),
+                    exit_reason=reason,
+                    duration_sec=duration_sec,
+                )
                 self.runtime_adaptation = self.adaptive_agent.on_real_trade_closed(trade_record)
                 # Refresh baseline adaptive params after learning update.
                 self.runtime_params = self.adaptive_agent.current_base_params()
@@ -5597,6 +6823,7 @@ class Bot:
                             )
                         except Exception as exc:
                             logging.warning("AI model restore reload failed: %s", exc)
+            self._refresh_confirmed_exchange_state(symbol, price)
         self._clear_position_memory(symbol)
         self.last_trade_ts = time.time()
         return True
@@ -5623,8 +6850,37 @@ class Bot:
         logging.info("Выполняется PARTIAL SELL: %.10f %s, причина: %s", base_amount, symbol, reason)
         quote_amount = 0.0
         try:
+            pre_pos = self.trader.get_position(symbol)
+            pre_base_free = max(0.0, _safe_float(pre_pos.get("base_free"), base_amount))
             order = self.trader.place_spot_sell(symbol, base_amount)
             quote_amount = _safe_float(order.get("cost"), 0.0) if isinstance(order, dict) else 0.0
+            confirmed, post_base = self._confirm_sell_position(
+                symbol,
+                pre_base_free,
+                retries=max(1, min(2, int(self.config.ORDER_CONFIRM_RETRIES))),
+                wait_sec=max(0.15, float(self.config.ORDER_CONFIRM_POLL_SEC) * 0.8),
+            )
+            if confirmed:
+                sold_confirmed = max(0.0, pre_base_free - post_base)
+                if sold_confirmed > 0:
+                    base_amount = sold_confirmed
+            reconcile = self._reconcile_post_order_position(
+                symbol=symbol,
+                side="sell",
+                pre_base_free=pre_base_free,
+                requested_base=base_amount,
+                quote_amount=quote_amount,
+                executed_price=px,
+            )
+            reconciled_qty = max(0.0, _safe_float(reconcile.get("confirmed_qty"), 0.0))
+            reconciled_quote = max(0.0, _safe_float(reconcile.get("confirmed_quote"), 0.0))
+            if reconciled_qty > 0:
+                base_amount = reconciled_qty
+            if reconciled_quote > 0 and (
+                quote_amount <= 0 or abs((reconciled_quote / max(1e-12, quote_amount)) - 1.0) > 0.35
+            ):
+                quote_amount = reconciled_quote
+            self._refresh_confirmed_exchange_state(symbol, px)
             self._record_order(order_type="sell", symbol=symbol, reason=reason, base_amount=base_amount, quote_amount=quote_amount, order=order)
             self.last_trade_ts = time.time()
             return True

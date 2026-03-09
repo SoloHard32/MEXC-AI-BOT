@@ -504,6 +504,8 @@ class BotWebWindow(QMainWindow):
         excluding current GUI process and optional exclude_pid.
         """
         target = str(BOT_PATH.resolve()).lower().replace("/", "\\")
+        target_name = "\\mexc_bot.py"
+        base_hint = str(BASE_DIR.resolve()).lower().replace("/", "\\")
         me = os.getpid()
         skip: set[int] = {me}
         if exclude_pid and exclude_pid > 0:
@@ -536,7 +538,11 @@ class BotWebWindow(QMainWindow):
                     if pid <= 0 or pid in skip:
                         continue
                     cmd = str(row.get("CommandLine", "") or "").lower().replace("/", "\\")
-                    if target in cmd and "mexc_bot_gui" not in cmd:
+                    same_bot_cmd = target in cmd
+                    # Fallback for path normalization differences in command line.
+                    if (not same_bot_cmd) and (target_name in cmd) and (base_hint in cmd):
+                        same_bot_cmd = True
+                    if same_bot_cmd and "mexc_bot_gui" not in cmd:
                         found.append(pid)
             else:
                 cp = subprocess.run(
@@ -609,7 +615,7 @@ class BotWebWindow(QMainWindow):
 
     def _enforce_single_bot_process(self, force: bool = False) -> int:
         now_ts = time.time()
-        if (not force) and (now_ts - self._last_dup_kill_ts) < 5.0:
+        if (not force) and (now_ts - self._last_dup_kill_ts) < 1.5:
             return 0
         with self._proc_lock:
             keep_pid = int(self.process.pid) if (self.process and self.process.poll() is None) else None
@@ -976,6 +982,10 @@ class BotWebWindow(QMainWindow):
             threading.Thread(target=self._read_process_output, daemon=True).start()
             self._stop_foreign_bot_processes(keep_pid=int(proc.pid))
             self._enforce_single_bot_process(force=True)
+            # Post-start race guard: catch delayed orphan/duplicate respawns.
+            QTimer.singleShot(900, lambda: self._enforce_single_bot_process(force=True))
+            QTimer.singleShot(2200, lambda: self._enforce_single_bot_process(force=True))
+            QTimer.singleShot(4200, lambda: self._enforce_single_bot_process(force=True))
         except Exception as exc:
             self._append_log(f"[GUI-WEB] Ошибка запуска: {exc}")
             self._emit_toast(f"Ошибка запуска: {exc}", "err")
@@ -1048,6 +1058,8 @@ class BotWebWindow(QMainWindow):
             if killed > 0:
                 self._append_log(f"[GUI-WEB] Остановлено сторонних процессов перед перезапуском: {killed}")
             self._start_bot_impl()
+            QTimer.singleShot(1200, lambda: self._enforce_single_bot_process(force=True))
+            QTimer.singleShot(3000, lambda: self._enforce_single_bot_process(force=True))
         except Exception as exc:
             self._append_log(f"[GUI-WEB] Ошибка перезапуска бота: {exc}")
             self._emit_toast(f"Ошибка перезапуска: {exc}", "err")
@@ -1204,13 +1216,17 @@ class BotWebWindow(QMainWindow):
 
         session_report = self._build_session_report(live)
 
+        is_training_mode = str(live.get("bot_mode", "") or "").strip().lower() == "training"
+        is_dry_run = bool(live.get("dry_run", False))
+        position_state_exists = (RUNTIME_DIR / "position_state.json").exists() or (RUNTIME_DIR / "position_state.json.bak").exists()
         report = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "live": live,
             "ai": {"ai_status_path": str(AI_PATH), "ai_status": ai},
             "health_flags": {
                 "live_file_present": LIVE_PATH.exists(),
-                "position_state_present": (RUNTIME_DIR / "position_state.json").exists() or (RUNTIME_DIR / "position_state.json.bak").exists(),
+                # In training+dry-run, position state persistence is optional and may be intentionally absent.
+                "position_state_present": (position_state_exists or (is_training_mode and is_dry_run)),
                 "bot_log_present": LOG_PATH.exists(),
                 "ai_status_present": AI_PATH.exists(),
                 "live_stale": stale_age > 30,
