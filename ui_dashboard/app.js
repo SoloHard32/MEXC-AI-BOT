@@ -3,9 +3,12 @@ let state = null;
 let activeTab = 'all';
 let _logsRenderSig = '';
 let _chartRenderSig = '';
+let _pendingState = null;
+let _renderQueued = false;
+let _lastLocaleSig = '';
 
 function esc(s){ return String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
-const RIGHT_PANEL_KEYS = ['warnings', 'training', 'market', 'ops', 'session', 'guard'];
+const RIGHT_PANEL_KEYS = ['warnings', 'training', 'market', 'guard'];
 let uiLang = 'ru';
 
 const I18N = {
@@ -14,34 +17,39 @@ const I18N = {
     conn_mode: 'Режим',
     banner_training: 'AI обучение активно. DRY RUN: реальные ордера не отправляются.',
     banner_live: 'Боевой режим LIVE: реальные ордера разрешены.',
+    banner_stopped: 'Бот остановлен. Запусти его, чтобы телеметрия снова наполнилась.',
     labels: {
       symbol: 'Символ', cycle: 'Цикл', event: 'Событие',
       usdt_real: 'USDT (реальный)', usdt_train: 'USDT (обучение)', pnl: 'PnL %', pair: 'Пара', price: 'Цена',
-      action: 'Action', conf: 'Conf', quality: 'Quality', edge: 'Expected edge', min_edge: 'Min edge', health: 'Health', drift: 'Drift',
-      model: 'Model', online: 'Online', hit_rate: 'Hit-rate', wf: 'WF', labels: 'Labels', samples: 'Samples', real_labels: 'Real labels',
-      regime: 'Regime', flags: 'Flags', volatility: 'Volatility', anomaly: 'Anomaly', data_stale: 'Data stale',
-      locked: 'Locked', reason: 'Reason', api_errors: 'API errors', trades_day: 'Trades/day', drawdown: 'Drawdown',
-      warnings: 'Warnings', errors: 'Errors', top_block: 'Top block', events: 'Событий',
-      cycle_est: 'Цикл (оценка)', status_age: 'Возраст статуса', market_age: 'Возраст рынка', cooldown: 'Cooldown', api_window: 'API окно',
-      backend: 'Backend', advisory: 'Advisory', adv_signal: 'Adv signal', adv_applied: 'Adv applied',
-      cycle_stability: 'Стабильность цикла', decisions_quality: 'Качество решений',
+      balance_source: 'Источник баланса',
+      action: 'Действие', conf: 'Уверенность', quality: 'Качество', edge: 'Ожид. преимущество', min_edge: 'Мин. преимущество', health: 'Здоровье', drift: 'Дрейф',
+      model: 'Модель', online: 'Онлайн', hit_rate: 'Точность', wf: 'WF', labels: 'Метки', samples: 'Сэмплы', real_labels: 'Реальные метки',
+      regime: 'Режим рынка', flags: 'Флаги', volatility: 'Волатильность', anomaly: 'Аномалия', data_stale: 'Данные устарели',
+      locked: 'Блокировка', reason: 'Причина', api_errors: 'Ошибки API', trades_day: 'Сделок/день', drawdown: 'Просадка',
+      warnings: 'Предупреждения', errors: 'Ошибки', top_block: 'Главный блокер', events: 'Событий',
       no_critical: 'Нет критичных предупреждений', waiting: 'Ожидание телеметрии...',
+      updating: 'Обновляется...',
+      no_chart_data: 'Нет телеметрии для графика...',
+      telemetry_wait_trade: 'Телеметрия пары появится только во время открытой сделки.',
+      data_quality: 'Качество данных',
+      signal_reason: 'Объяснение',
+      telem_quality: 'Качество',
+      telem_edge: 'Edge',
+      telem_backend: 'Backend',
       important: 'Важные', search: 'Поиск...', all: 'Все', trades: 'Сделки', signals: 'Сигналы', errs: 'Ошибки',
-      live_status: 'Статус', live_mode: 'Режим', live_pair: 'Пара', live_price: 'Цена', live_event: 'Событие', live_reason: 'Причина', live_guard: 'Guard',
-      live_orders_empty: 'Нет данных', labels_observed: '(набл., live)', labels_real: '(real)',
+      live_status: 'Статус', live_mode: 'Режим', live_pair: 'Пара', live_price: 'Цена', live_event: 'Событие', live_reason: 'Причина', live_guard: 'Защита',
+      live_orders_empty: 'Нет данных', labels_observed: '(набл., live)', labels_real: '(реал.)',
     },
     ui: {
       hControl: 'Управление ботом',
-      btnStart: 'Запуск', btnStop: 'Стоп', btnRestart: 'Рестарт', btnSave: 'Сохранить', btnLogs: 'Логи', btnHealth: 'Health',
-      btnSafeReset: 'Safe reset', openLiveBtn: 'Live окно', openAdvBtn: 'Расширенные настройки',
-      btnOpenReport: 'Открыть report', btnReportsDir: 'Папка reports', btnExportAi: 'Экспорт AI', btnImportAi: 'Импорт AI',
-      modeLabel: 'Режим:', hBalance: 'Баланс', hAiModule: 'AI модуль', hTelemetry: 'Телеметрия', telemetryPill: 'Backend Candles',
-      hLogs: 'Логи', hWarnings: 'Предупреждения', hTraining: 'Обучение', hMarket: 'Рынок', hOps: 'Системная телеметрия',
-      hSession: 'Сессия сейчас', hGuard: 'Risk guard',
+      btnStart: 'Запуск', btnStop: 'Стоп', btnRestart: 'Рестарт', btnSave: 'Сохранить', btnLogs: 'Логи',
+      openLiveBtn: 'Live окно', openAdvBtn: 'Настройки', btnReportsDir: 'Отчёты',
+      modeLabel: 'Режим:', hBalance: 'Баланс', hAiModule: 'AI модуль', hTelemetry: 'Телеметрия', telemetryPill: 'Сигналы / health',
+      hLogs: 'Логи', hWarnings: 'Предупреждения', hTraining: 'Обучение', hMarket: 'Рынок', hGuard: 'Защита риска',
       hAdv: 'Расширенные настройки', advCloseBtn: 'Закрыть', advSaveBtn: 'Сохранить настройки',
       lblApiKey: 'API key (MEXC)', lblApiSecret: 'API secret (MEXC)', lblAdvisoryEnable: 'Включить внешний advisory (overlay)',
-      lblAdvisoryName: 'Advisory provider name', lblAdvisoryUrl: 'Advisory URL', lblTimeoutSec: 'Timeout sec', lblTtlSec: 'TTL sec',
-      lblWeightTraining: 'Weight training (0..0.35)', lblWeightLive: 'Weight live (0..0.35)',
+      lblAdvisoryName: 'Название advisory-провайдера', lblAdvisoryUrl: 'URL advisory', lblTimeoutSec: 'Таймаут, сек', lblTtlSec: 'TTL, сек',
+      lblWeightTraining: 'Вес training (0..0.35)', lblWeightLive: 'Вес live (0..0.35)',
       lblPaperStart: 'Paper стартовый баланс (USDT, training)',
       lblPaperApply: 'Применить сразу (сбросить paper-позиции, только при остановленном боте)',
       lblUiLanguage: 'Язык интерфейса',
@@ -49,7 +57,7 @@ const I18N = {
       advStatusChecking: 'Статус: проверка advisory...',
       advStatusPrefix: 'Статус:',
       advStatusCheckError: 'Статус: ошибка автопроверки advisory.',
-      hLiveNow: 'Сейчас', hLiveAiMarket: 'AI / Рынок', hLiveRisk: 'Риск / Баланс', hLiveOrders: 'Последние ордера',
+      hLiveNow: 'Сейчас', hLiveAiMarket: 'AI / Рынок', hLiveRisk: 'Риск / Баланс',
       hLiveModal: 'Live мониторинг', liveCloseBtn: 'Закрыть',
     },
   },
@@ -58,30 +66,35 @@ const I18N = {
     conn_mode: 'Mode',
     banner_training: 'AI training active. DRY RUN: real orders are not sent.',
     banner_live: 'LIVE mode: real orders are enabled.',
+    banner_stopped: 'Bot is stopped. Start it to resume telemetry.',
     labels: {
       symbol: 'Symbol', cycle: 'Cycle', event: 'Event',
       usdt_real: 'USDT (real)', usdt_train: 'USDT (training)', pnl: 'PnL %', pair: 'Pair', price: 'Price',
+      balance_source: 'Balance source',
       action: 'Action', conf: 'Conf', quality: 'Quality', edge: 'Expected edge', min_edge: 'Min edge', health: 'Health', drift: 'Drift',
       model: 'Model', online: 'Online', hit_rate: 'Hit-rate', wf: 'WF', labels: 'Labels', samples: 'Samples', real_labels: 'Real labels',
       regime: 'Regime', flags: 'Flags', volatility: 'Volatility', anomaly: 'Anomaly', data_stale: 'Data stale',
       locked: 'Locked', reason: 'Reason', api_errors: 'API errors', trades_day: 'Trades/day', drawdown: 'Drawdown',
       warnings: 'Warnings', errors: 'Errors', top_block: 'Top block', events: 'Events',
-      cycle_est: 'Cycle (est)', status_age: 'Status age', market_age: 'Market age', cooldown: 'Cooldown', api_window: 'API window',
-      backend: 'Backend', advisory: 'Advisory', adv_signal: 'Adv signal', adv_applied: 'Adv applied',
-      cycle_stability: 'Cycle stability', decisions_quality: 'Decision quality',
       no_critical: 'No critical warnings', waiting: 'Waiting for telemetry...',
+      updating: 'Updating...',
+      no_chart_data: 'No telemetry data for chart...',
+      telemetry_wait_trade: 'Pair telemetry is shown only while a position is open.',
+      data_quality: 'Data quality',
+      signal_reason: 'Explanation',
+      telem_quality: 'Quality',
+      telem_edge: 'Edge',
+      telem_backend: 'Backend',
       important: 'Important', search: 'Search...', all: 'All', trades: 'Trades', signals: 'Signals', errs: 'Errors',
       live_status: 'Status', live_mode: 'Mode', live_pair: 'Pair', live_price: 'Price', live_event: 'Event', live_reason: 'Reason', live_guard: 'Guard',
       live_orders_empty: 'No data', labels_observed: '(observed, live)', labels_real: '(real)',
     },
     ui: {
       hControl: 'Bot Control',
-      btnStart: 'Start', btnStop: 'Stop', btnRestart: 'Restart', btnSave: 'Save', btnLogs: 'Logs', btnHealth: 'Health',
-      btnSafeReset: 'Safe reset', openLiveBtn: 'Live window', openAdvBtn: 'Advanced settings',
-      btnOpenReport: 'Open report', btnReportsDir: 'Reports folder', btnExportAi: 'Export AI', btnImportAi: 'Import AI',
-      modeLabel: 'Mode:', hBalance: 'Balance', hAiModule: 'AI module', hTelemetry: 'Telemetry', telemetryPill: 'Backend Candles',
-      hLogs: 'Logs', hWarnings: 'Warnings', hTraining: 'Training', hMarket: 'Market', hOps: 'System telemetry',
-      hSession: 'Session now', hGuard: 'Risk guard',
+      btnStart: 'Start', btnStop: 'Stop', btnRestart: 'Restart', btnSave: 'Save', btnLogs: 'Logs',
+      openLiveBtn: 'Live window', openAdvBtn: 'Settings', btnReportsDir: 'Reports',
+      modeLabel: 'Mode:', hBalance: 'Balance', hAiModule: 'AI module', hTelemetry: 'Telemetry', telemetryPill: 'Signals / health',
+      hLogs: 'Logs', hWarnings: 'Warnings', hTraining: 'Training', hMarket: 'Market', hGuard: 'Risk guard',
       hAdv: 'Advanced settings', advCloseBtn: 'Close', advSaveBtn: 'Save settings',
       lblApiKey: 'API key (MEXC)', lblApiSecret: 'API secret (MEXC)', lblAdvisoryEnable: 'Enable external advisory (overlay)',
       lblAdvisoryName: 'Advisory provider name', lblAdvisoryUrl: 'Advisory URL', lblTimeoutSec: 'Timeout sec', lblTtlSec: 'TTL sec',
@@ -93,7 +106,7 @@ const I18N = {
       advStatusChecking: 'Status: checking advisory...',
       advStatusPrefix: 'Status:',
       advStatusCheckError: 'Status: advisory self-check failed.',
-      hLiveNow: 'Now', hLiveAiMarket: 'AI / Market', hLiveRisk: 'Risk / Balance', hLiveOrders: 'Recent orders',
+      hLiveNow: 'Now', hLiveAiMarket: 'AI / Market', hLiveRisk: 'Risk / Balance',
       hLiveModal: 'Live monitoring', liveCloseBtn: 'Close',
     },
   },
@@ -116,28 +129,42 @@ function setKV(elId, rows){
   el.innerHTML = rows.map(([k,v]) => `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`).join('');
 }
 
-function setEventsBlock(elId, lines){
-  const el = document.getElementById(elId);
-  if (!el) return;
-  const arr = Array.isArray(lines) ? lines : [];
-  el.innerHTML = arr.length ? arr.map(x => `<div class="event-line">${esc(x)}</div>`).join('') : tr('labels.live_orders_empty');
+function displayLivePrice(rawPrice, status){
+  const priceNum = Number(rawPrice || 0);
+  const s = status || {};
+  if (priceNum > 0) return rawPrice;
+  const evt = String(s.event || '').toLowerCase();
+  const statusText = String(s.status || '').toLowerCase();
+  const running = statusText === 'работает' || statusText === 'running';
+  if (running && evt === 'cycle_busy') return tr('labels.updating');
+  return rawPrice || '-';
+}
+
+function translateBalanceSource(raw){
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return '-';
+  if (uiLang === 'en') {
+    if (v === 'exchange') return 'Exchange';
+    if (v === 'cache') return 'Cached exchange';
+    if (v === 'paper') return 'Paper only';
+    if (v === 'unknown') return 'Unknown';
+    return raw;
+  }
+  if (v === 'exchange') return 'Биржа';
+  if (v === 'cache') return 'Кэш биржи';
+  if (v === 'paper') return 'Только paper';
+  if (v === 'unknown') return 'Неизвестно';
+  return raw;
+}
+
+function yesNo(value){
+  const on = !!value;
+  if (uiLang === 'en') return on ? 'ON' : 'OFF';
+  return on ? 'ВКЛ' : 'ВЫКЛ';
 }
 
 function clamp(v, lo, hi){
   return Math.max(lo, Math.min(hi, Number(v || 0)));
-}
-
-function setMeter(barId, textId, value){
-  const bar = document.getElementById(barId);
-  const txt = document.getElementById(textId);
-  const score = clamp(value, 0, 100);
-  if (txt) txt.textContent = `${score.toFixed(0)}%`;
-  if (!bar) return;
-  bar.style.width = `${score.toFixed(0)}%`;
-  let cls = 'mid';
-  if (score >= 70) cls = 'good';
-  else if (score < 40) cls = 'bad';
-  bar.className = `meter-fill ${cls}`;
 }
 
 function resizeCanvas(canvas){
@@ -271,28 +298,15 @@ function renderLogs(lines){
   }).join('');
 }
 
-function renderOrders(rows){
-  const body = document.getElementById('ordersBody');
-  if (!body) return;
-  body.innerHTML = (rows || []).slice(0, 30).map(r => `
-    <tr>
-      <td>${esc(r.ts_utc || '')}</td>
-      <td>${esc(r.symbol || '')}</td>
-      <td>${esc(r.type || '')}</td>
-      <td>${esc(r.reason || '')}</td>
-      <td>${Number(r.base_amount || 0).toFixed(6)}</td>
-      <td>${Number(r.quote_amount || 0).toFixed(2)}</td>
-    </tr>
-  `).join('');
-}
-
-function drawChart(payload){
+function drawChart(payload, status){
   const c = document.getElementById('edgeChart');
   if (!c) return;
+  const s = status || {};
   const candlesRaw = Array.isArray(payload?.candles) ? payload.candles : [];
   const nSig = candlesRaw.length;
   const lastSig = nSig > 0 ? candlesRaw[nSig - 1] : null;
-  const sig = `${uiLang}|${nSig}|${lastSig ? [lastSig.o,lastSig.h,lastSig.l,lastSig.c,lastSig.v].join('|') : '-'}`;
+  const positionOpen = !!s.has_open_position;
+  const sig = `${uiLang}|${positionOpen ? 1 : 0}|${nSig}|${lastSig ? [lastSig.o,lastSig.h,lastSig.l,lastSig.c,lastSig.v].join('|') : '-'}`;
   if (sig === _chartRenderSig && c.width > 0 && c.height > 0) return;
   _chartRenderSig = sig;
   resizeCanvas(c);
@@ -312,6 +326,13 @@ function drawChart(payload){
   ctx.fillStyle = '#070d16';
   ctx.fillRect(0, 0, w, h);
 
+  if (!positionOpen) {
+    ctx.fillStyle = '#8da6c8';
+    ctx.font = '13px Segoe UI';
+    ctx.fillText(tr('labels.telemetry_wait_trade'), left, h / 2);
+    return;
+  }
+
   const candles = candlesRaw
     .map(x => ({
       o: Number(x?.o || 0),
@@ -324,9 +345,74 @@ function drawChart(payload){
     .slice(-80);
 
   if (!candles.length) {
+    const q = Array.isArray(payload?.ai_quality) ? payload.ai_quality.map(Number).filter(Number.isFinite) : [];
+    const e = Array.isArray(payload?.expected_edge) ? payload.expected_edge.map(Number).filter(Number.isFinite).map(v => v * 100) : [];
+    const bh = Array.isArray(payload?.backend_health) ? payload.backend_health.map(Number).filter(Number.isFinite) : [];
+    const series = [
+      { key: 'quality', label: tr('labels.telem_quality'), color: '#f3c44f', values: q.slice(-80), valueSuffix: '' },
+      { key: 'edge', label: tr('labels.telem_edge'), color: '#9d63ff', values: e.slice(-80), valueSuffix: '%' },
+      { key: 'backend', label: tr('labels.telem_backend'), color: '#00d8a8', values: bh.slice(-80), valueSuffix: '%' },
+    ].filter(item => item.values.length > 1);
+
+    if (!series.length) {
+      ctx.fillStyle = '#8da6c8';
+      ctx.font = '13px Segoe UI';
+      ctx.fillText(tr('labels.no_chart_data'), left, h / 2);
+      return;
+    }
+
+    const normalizeSeries = (values) => {
+      let minV = Math.min(...values);
+      let maxV = Math.max(...values);
+      if (!Number.isFinite(minV) || !Number.isFinite(maxV) || maxV <= minV) {
+        minV -= 1;
+        maxV += 1;
+      }
+      const span = Math.max(1e-9, maxV - minV);
+      return values.map(v => (v - minV) / span);
+    };
+    const mapY = (v) => mainBottom - v * (mainBottom - top);
+
+    ctx.setLineDash([4, 6]);
+    ctx.strokeStyle = 'rgba(120,146,180,0.20)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 6; i++) {
+      const y = top + i * (mainBottom - top) / 5;
+      ctx.beginPath();
+      ctx.moveTo(left, y);
+      ctx.lineTo(right, y);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
     ctx.fillStyle = '#8da6c8';
-    ctx.font = '13px Segoe UI';
-    ctx.fillText('Нет свечных данных (ожидание циклов)...', left, h / 2);
+    ctx.font = '12px Segoe UI';
+    for (let i = 0; i < 6; i++) {
+      const y = top + i * (mainBottom - top) / 5;
+      const pct = 100 - (i * 20);
+      ctx.fillText(`${pct}%`, 10, y + 4);
+    }
+
+    series.forEach((item, idx) => {
+      const vals = normalizeSeries(item.values);
+      const step = (right - left) / Math.max(1, vals.length - 1);
+      ctx.strokeStyle = item.color;
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      vals.forEach((value, i) => {
+        const x = left + i * step;
+        const y = mapY(value);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.fillStyle = item.color;
+      const latestRaw = item.values[item.values.length - 1];
+      const latestText = Number.isFinite(latestRaw) ? latestRaw.toFixed(item.key === 'backend' ? 0 : 2) : '-';
+      ctx.fillText(`${item.label} ${latestText}${item.valueSuffix}`, left + idx * 122, top + 12);
+    });
+    ctx.fillStyle = '#8da6c8';
+    ctx.fillText(uiLang === 'en' ? 'Normalized history' : 'Нормализованная история', left, volTop + 12);
     return;
   }
 
@@ -442,6 +528,9 @@ function drawChart(payload){
 }
 
 function applyLocaleStatic(){
+  const localeSig = `${uiLang}`;
+  if (_lastLocaleSig === localeSig) return;
+  _lastLocaleSig = localeSig;
   document.documentElement.lang = uiLang;
   const ui = (I18N[uiLang] || I18N.ru).ui || {};
   const setTxt = (id, val) => {
@@ -449,19 +538,18 @@ function applyLocaleStatic(){
     if (el && typeof val === 'string') el.textContent = val;
   };
   [
-    'hControl','btnStart','btnStop','btnRestart','btnSave','btnLogs','btnHealth','btnSafeReset','openLiveBtn','openAdvBtn',
-    'btnOpenReport','btnReportsDir','btnExportAi','btnImportAi','modeLabel','hBalance','hAiModule','hTelemetry','telemetryPill',
-    'hLogs','hWarnings','hTraining','hMarket','hOps','hSession','hGuard','hAdv','advCloseBtn','advSaveBtn',
+    'hControl','btnStart','btnStop','btnRestart','btnSave','btnLogs','openLiveBtn','openAdvBtn',
+    'btnReportsDir','modeLabel','hBalance','hAiModule','hTelemetry','telemetryPill',
+    'hLogs','hWarnings','hTraining','hMarket','hGuard','hAdv','advCloseBtn','advSaveBtn',
     'lblApiKey','lblApiSecret','lblAdvisoryName','lblAdvisoryUrl','lblTimeoutSec','lblTtlSec','lblWeightTraining','lblWeightLive',
-    'lblPaperStart','lblUiLanguage','lblCycleHealth','lblDecisionHealth'
+    'lblPaperStart','lblUiLanguage'
   ].forEach((id) => setTxt(id, ui[id]));
 
   const liveTitles = document.querySelectorAll('.live-grid .card h3');
-  if (liveTitles.length >= 4) {
+  if (liveTitles.length >= 3) {
     liveTitles[0].textContent = ui.hLiveNow || liveTitles[0].textContent;
     liveTitles[1].textContent = ui.hLiveAiMarket || liveTitles[1].textContent;
     liveTitles[2].textContent = ui.hLiveRisk || liveTitles[2].textContent;
-    liveTitles[3].textContent = ui.hLiveOrders || liveTitles[3].textContent;
   }
   const liveHead = document.querySelector('#liveModal .modal-head h3');
   if (liveHead) liveHead.textContent = ui.hLiveModal || liveHead.textContent;
@@ -526,7 +614,6 @@ function render(st){
   if (!['ru', 'en'].includes(uiLang)) uiLang = 'ru';
   applyLocaleStatic();
   const conn = document.getElementById('connBadge');
-  const advisoryTop = document.getElementById('advisoryBadge');
   conn.textContent = h.connection_text || '-';
   conn.className = 'badge ' + (
     h.connection === 'connected' ? 'ok' :
@@ -537,23 +624,16 @@ function render(st){
   );
   document.getElementById('tsText').textContent = `${tr('conn_update')}: ${h.ts || '-'}`;
   document.getElementById('modeText').textContent = `${tr('conn_mode')}: ${h.mode || '-'}`;
-  const backend = (h.backend || 'python').toString();
-  document.getElementById('marketText').textContent = `${h.market || 'SPOT'} / MEXC / ${backend}`;
+  document.getElementById('marketText').textContent = `${h.market || 'SPOT'} / MEXC`;
   document.getElementById('pidText').textContent = `PID ${h.pid || '-'}`;
-  if (advisoryTop) {
-    advisoryTop.textContent = h.advisory_status_text || 'Advisory: -';
-    advisoryTop.className = 'badge ' + (
-      h.advisory_enabled
-        ? (h.advisory_ok ? 'ok' : (h.advisory_muted ? 'warn' : 'err'))
-        : ''
-    );
-  }
-  const bannerText = ((st.controls || {}).mode || '').toLowerCase() === 'live' ? tr('banner_live') : tr('banner_training');
-  document.getElementById('banner').textContent = bannerText;
-
   const controls = st.controls || {};
   const proc = st.proc || {};
   const procBusy = !!proc.busy;
+  const runningNow = !!controls.running;
+  const bannerText = !runningNow && !procBusy
+    ? tr('banner_stopped')
+    : (String(controls.mode || '').toLowerCase() === 'live' ? tr('banner_live') : tr('banner_training'));
+  document.getElementById('banner').textContent = bannerText;
   const mode = (controls.mode || 'training').toLowerCase();
   const bTrain = document.getElementById('modeTraining');
   const bLive = document.getElementById('modeLive');
@@ -563,18 +643,21 @@ function render(st){
   }
 
   const s = st.status || {};
+  const statusReason = s.no_entry_summary || s.reason || '-';
+  const signalReason = s.signal_reason || statusReason;
+  const livePriceText = displayLivePrice((st.balance || {}).price, s);
   setKV('statusMini', [
     [tr('labels.symbol'), s.symbol],
     [tr('labels.cycle'), s.cycle],
-    [tr('labels.event'), s.event],
+    [tr('labels.price'), livePriceText],
+    [tr('labels.signal_reason'), translateReasonLine(signalReason)],
   ]);
   const b = st.balance || {};
   setKV('balanceCard', [
     [tr('labels.usdt_real'), b.exchange_usdt],
     [tr('labels.usdt_train'), b.paper_usdt],
-    [tr('labels.pnl'), b.pnl_pct + '%'],
-    [tr('labels.pair'), b.symbol],
-    [tr('labels.price'), b.price],
+    [tr('labels.pnl'), `${b.pnl_pct ?? 0}%`],
+    [tr('labels.balance_source'), translateBalanceSource(b.exchange_balance_source || '-')],
   ]);
   const a = st.ai_signal || {};
   setKV('aiCard', [
@@ -582,9 +665,6 @@ function render(st){
     [tr('labels.conf'), a.conf],
     [tr('labels.quality'), a.quality],
     [tr('labels.edge'), a.edge_pct + '%'],
-    [tr('labels.min_edge'), a.min_edge_pct + '%'],
-    [tr('labels.health'), a.health],
-    [tr('labels.drift'), `${a.drift} / ${a.drift_active ? 'ON' : 'OFF'}`],
   ]);
   const t = st.training || {};
   const labelsReal = Number(t.labels || 0);
@@ -596,11 +676,8 @@ function render(st){
     : `${labelsReal} ${tr('labels.labels_real')}`;
   const trainingRows = [
     [tr('labels.model'), t.model],
-    [tr('labels.online'), t.online ? 'ON' : 'OFF'],
     [tr('labels.hit_rate'), t.hit_rate + '%'],
-    [tr('labels.wf'), t.wf + '%'],
     [tr('labels.labels'), labelsView],
-    [tr('labels.samples'), samples],
   ];
   if (labelsMode === 'observed') {
     trainingRows.push([tr('labels.real_labels'), labelsBaseReal]);
@@ -609,56 +686,24 @@ function render(st){
   const m = st.market || {};
   setKV('marketCard', [
     [tr('labels.regime'), m.regime],
-    [tr('labels.flags'), (m.flags || []).join(', ') || '-'],
     [tr('labels.volatility'), m.volatility],
     [tr('labels.anomaly'), m.anomaly],
-    [tr('labels.data_stale'), m.data_stale ? 'YES' : 'NO'],
+    [tr('labels.data_quality'), `${((m.data_quality_score ?? 0) * 100).toFixed(0)}%`],
   ]);
   const g = st.guard || {};
   setKV('guardCard', [
-    [tr('labels.locked'), g.locked ? 'YES' : 'NO'],
-    [tr('labels.reason'), g.reason || '-'],
+    [tr('labels.locked'), yesNo(g.locked)],
     [tr('labels.api_errors'), `${g.api_errors}/${g.api_max}`],
-    [tr('labels.trades_day'), `${g.trades_day}/${g.trades_max}`],
     [tr('labels.drawdown'), g.drawdown + '%'],
   ]);
-  const sess = st.session || {};
-  setKV('sessionCard', [
-    [tr('labels.warnings'), Number(sess.warnings || 0).toFixed(0)],
-    [tr('labels.errors'), Number(sess.errors || 0).toFixed(0)],
-    [tr('labels.top_block'), sess.top_block_reason || '-'],
-    [tr('labels.events'), Number(sess.audit_events || 0).toFixed(0)],
-  ]);
-  const o = st.ops || {};
-  const engineLabel = `${String(o.engine_backend || 'python')} / ${String(o.engine_mode || 'native')}`;
-  const engineHealth = o.engine_healthy ? 'OK' : 'fallback';
-  const opsRows = [
-    [tr('labels.cycle_est'), `${Number(o.cycle_ms_est || 0).toFixed(0)} ms`],
-    [tr('labels.status_age'), `${Number(o.status_age_sec || 0).toFixed(1)} s`],
-    [tr('labels.market_age'), `${Number(o.market_age_sec || 0).toFixed(1)} s`],
-    [tr('labels.cooldown'), `${Number(o.cooldown_sec || 0).toFixed(0)} s`],
-    [tr('labels.api_window'), `${Number(o.api_err || 0).toFixed(0)}/${Number(o.api_err_max || 0).toFixed(0)}`],
-    [tr('labels.backend'), `${engineLabel} (${engineHealth})`],
-  ];
-  if (o.advisory_enabled) {
-    opsRows.push([tr('labels.advisory'), `${o.advisory_source || 'external'} (${o.advisory_ok ? 'OK' : 'OFF'})`]);
-    opsRows.push([tr('labels.adv_signal'), `${o.advisory_action || 'HOLD'} | conf ${Number(o.advisory_confidence || 0).toFixed(2)} | bias ${Number(o.advisory_edge_bias_pct || 0).toFixed(2)}%`]);
-    opsRows.push([tr('labels.adv_applied'), o.advisory_applied ? 'YES' : 'NO']);
-  }
-  setKV('opsCard', opsRows);
-  setMeter('cycleHealthBar', 'cycleHealthText', Number(o.cycle_health_score || 0));
-  setMeter('decisionHealthBar', 'decisionHealthText', Number(o.decision_health_score || 0));
-  const hints = [];
-  if (o.top_block_reason) hints.push(`Главная причина блокировки: ${o.top_block_reason}`);
-  const hintsEl = document.getElementById('opsHints');
-  if (hintsEl) hintsEl.innerHTML = hints.length ? hints.map(x => `<div>• ${esc(x)}</div>`).join('') : tr('labels.waiting');
 
   const warns = st.warnings || [];
-  document.getElementById('warnBox').innerHTML = warns.length ? warns.map(w => `<div>• ${esc(translateWarningLine(w))}</div>`).join('') : tr('labels.no_critical');
+  const signalExplain = Array.isArray(s.signal_explainer) ? s.signal_explainer.slice(0, 2).map(translateReasonLine) : [];
+  const compactWarns = [...signalExplain, ...warns.map(translateWarningLine)].slice(0, 3);
+  document.getElementById('warnBox').innerHTML = compactWarns.length ? compactWarns.map(w => `<div>• ${esc(w)}</div>`).join('') : tr('labels.no_critical');
 
-  renderOrders(st.recent_orders || []);
   renderLogs(st.logs || []);
-  drawChart(st.telemetry || {});
+  drawChart(st.telemetry || {}, s);
 
   const aiBadge = document.getElementById('badgeAiSignal');
   const guardBadge = document.getElementById('badgeGuard');
@@ -669,7 +714,7 @@ function render(st){
     aiBadge.className = 'small-badge ' + ((ai.quality || 0) >= 0.6 ? 'ok' : (ai.quality || 0) >= 0.45 ? 'warn' : 'err');
   }
   if (guardBadge) {
-    guardBadge.textContent = `Guard: ${gd.locked ? 'ON' : 'OFF'}`;
+    guardBadge.textContent = `${tr('labels.live_guard')}: ${yesNo(gd.locked)}`;
     guardBadge.className = 'small-badge ' + (gd.locked ? 'warn' : 'ok');
   }
 
@@ -689,6 +734,21 @@ function render(st){
     const op = String(proc.op || 'operation');
     document.getElementById('banner').textContent = `Системная операция: ${op} (${sec}s)...`;
   }
+}
+
+function flushLatestState(){
+  _renderQueued = false;
+  if (document.hidden) return;
+  const next = _pendingState;
+  _pendingState = null;
+  if (next) render(next);
+}
+
+function scheduleRender(st){
+  _pendingState = st;
+  if (document.hidden || _renderQueued) return;
+  _renderQueued = true;
+  window.requestAnimationFrame(flushLatestState);
 }
 
 function showToast(msg){
@@ -879,7 +939,7 @@ function bindActions(){
   });
   if (liveCloseBtn) liveCloseBtn.addEventListener('click', () => liveModal.classList.add('hidden'));
 
-  window.addEventListener('resize', () => { if (state) drawChart(state.telemetry || {}); });
+  window.addEventListener('resize', () => { if (state) drawChart(state.telemetry || {}, (state.status || {})); });
   applyLocaleStatic();
   setUiLangButtons(uiLang || 'ru');
   initRightPanelsState();
@@ -891,44 +951,59 @@ function renderLiveModal(st){
   const a = st.ai_signal || {};
   const m = st.market || {};
   const g = st.guard || {};
+  const header = st.header || {};
+  const livePriceText = displayLivePrice(b.price, s);
   setKV('liveNow', [
     [tr('labels.live_status'), s.status || '-'],
-    [tr('labels.live_mode'), (st.header || {}).mode || '-'],
+    [tr('labels.live_mode'), header.mode || '-'],
     [tr('labels.live_pair'), s.symbol || '-'],
-    [tr('labels.live_price'), b.price || '-'],
-    [tr('labels.live_event'), s.event || '-'],
-    [tr('labels.live_reason'), translateReasonLine(s.reason || '-')],
+    [tr('labels.live_price'), livePriceText],
+    [tr('labels.live_reason'), translateReasonLine(s.signal_reason || s.no_entry_summary || s.reason || '-')],
+    [tr('conn_update'), header.ts || '-'],
   ]);
   setKV('liveAiMarket', [
-    ['AI action', a.action || '-'],
-    ['Quality', a.quality ?? '-'],
-    ['Expected edge', `${a.edge_pct ?? 0}%`],
-    ['Regime', m.regime || '-'],
-    ['Volatility', m.volatility ?? '-'],
-    ['Anomaly', m.anomaly ?? '-'],
+    [tr('labels.action'), a.action || '-'],
+    [tr('labels.quality'), a.quality ?? '-'],
+    [tr('labels.edge'), `${a.edge_pct ?? 0}%`],
+    [tr('labels.regime'), m.regime || '-'],
+    [tr('labels.volatility'), m.volatility ?? '-'],
+    [tr('labels.data_quality'), `${((m.data_quality_score ?? 0) * 100).toFixed(0)}%`],
+    [tr('labels.anomaly'), m.anomaly ?? '-'],
   ]);
   setKV('liveRisk', [
     [tr('labels.usdt_real'), b.exchange_usdt ?? '-'],
     [tr('labels.usdt_train'), b.paper_usdt ?? '-'],
     [tr('labels.pnl'), `${b.pnl_pct ?? 0}%`],
-    [tr('labels.live_guard'), g.locked ? 'ON' : 'OFF'],
+    [tr('labels.balance_source'), translateBalanceSource(b.exchange_balance_source || '-')],
+    [tr('labels.live_guard'), yesNo(g.locked)],
     [tr('labels.api_errors'), `${g.api_errors ?? 0}/${g.api_max ?? 0}`],
     [tr('labels.trades_day'), `${g.trades_day ?? 0}/${g.trades_max ?? 0}`],
+    [tr('labels.reason'), g.reason || '-'],
   ]);
-  const orders = (st.recent_orders || []).slice(0, 8).map(r => {
-    return `${r.ts_utc || ''} | ${r.type || '-'} | ${r.symbol || '-'} | ${r.reason || '-'}`;
-  });
-  setEventsBlock('liveOrders', orders);
 }
 
 new QWebChannel(qt.webChannelTransport, function(channel) {
   bridge = channel.objects.botBridge;
   bridge.stateChanged.connect(function(payload) {
-    try { render(JSON.parse(payload)); } catch (e) { console.error(e); }
+    try { scheduleRender(JSON.parse(payload)); } catch (e) { console.error(e); }
   });
   bridge.toast.connect(function(msg, level) {
     showToast(msg);
   });
   bindActions();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && _pendingState && !_renderQueued) {
+    _renderQueued = true;
+    window.requestAnimationFrame(flushLatestState);
+  }
+});
+
+window.addEventListener('focus', () => {
+  if (_pendingState && !_renderQueued) {
+    _renderQueued = true;
+    window.requestAnimationFrame(flushLatestState);
+  }
 });
 

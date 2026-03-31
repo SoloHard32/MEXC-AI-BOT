@@ -2,9 +2,11 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Environment
 .env
+.env.local
 .venv
 env/
 venv/
@@ -16,11 +18,16 @@ ENV/
 # Logs and data
 *.log
 *.csv
-*.json
-!gui_settings.json
-!ai_model.json
 *.db
 *.sqlite3
+gui_settings.json
+tmp_video_frames/
+logs/runtime/*
+logs/reports/*
+logs/training/*
+!logs/runtime/.gitkeep
+!logs/reports/.gitkeep
+!logs/training/.gitkeep
 
 # Distribution / packaging
 .Python

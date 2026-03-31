@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -30,6 +31,7 @@ from market_context import MarketContextEngine
 from model_evolver import ModelEvolver
 from mexc import MexcSync
 from position_overlays import PositionOverlayEngine
+from env_utils import load_env_layers
 
 try:
     import aiohttp  # type: ignore
@@ -186,6 +188,32 @@ def _auto_prune_runtime_logs(config: "Config") -> Dict[str, tuple[int, int]]:
     }
 
 
+def _rotate_runtime_file(path: Path, *, max_bytes: int, keep_archives: int = 25) -> bool:
+    if (not path.exists()) or (not path.is_file()):
+        return False
+    try:
+        if path.stat().st_size <= max_bytes:
+            return False
+        archive_dir = path.parent / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        archived = archive_dir / f"{path.stem}_{ts}{path.suffix}"
+        path.replace(archived)
+        archived_files = sorted(
+            archive_dir.glob(f"{path.stem}_*{path.suffix}"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in archived_files[max(1, int(keep_archives)):]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
 def _symbol_key(value: object) -> str:
     raw = str(value or "").strip().upper()
     if not raw:
@@ -197,6 +225,14 @@ def _symbol_key(value: object) -> str:
 
 def _force_utf8_stdio() -> None:
     """Force UTF-8 stdio on Windows to avoid Cyrillic mojibake in logs/UI pipes."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         if stream is None:
@@ -208,6 +244,7 @@ def _force_utf8_stdio() -> None:
             pass
     os.environ["PYTHONIOENCODING"] = "utf-8"
     os.environ["PYTHONUTF8"] = "1"
+    os.environ["PYTHONLEGACYWINDOWSSTDIO"] = "0"
 
 
 class _WindowsExecutionKeeper:
@@ -270,20 +307,46 @@ def _repair_mojibake_ru(text: object) -> str:
     )
     if not any(marker in raw for marker in mojibake_markers):
         return raw
+    def _looks_broken(value: str) -> bool:
+        return bool(value) and (("Р" in value and "С" in value) or ("Ð" in value and "Ñ" in value))
     try:
         repaired = raw.encode("cp1251", errors="strict").decode("utf-8", errors="strict")
-        # Accept only if mojibake markers disappear.
-        if repaired and not (("Р" in repaired and "С" in repaired) or ("Ð" in repaired and "Ñ" in repaired)):
+        if repaired and not _looks_broken(repaired):
             return repaired
     except Exception:
         pass
     try:
         repaired2 = raw.encode("latin1", errors="strict").decode("utf-8", errors="strict")
-        if repaired2 and not (("Р" in repaired2 and "С" in repaired2) or ("Ð" in repaired2 and "Ñ" in repaired2)):
+        if repaired2 and not _looks_broken(repaired2):
             return repaired2
     except Exception:
         pass
+    try:
+        repaired3 = raw.encode("cp866", errors="strict").decode("utf-8", errors="strict")
+        if repaired3 and not _looks_broken(repaired3):
+            return repaired3
+    except Exception:
+        pass
     return raw
+
+
+def _is_mojibake_ru(text: object) -> bool:
+    raw = str(text or "")
+    if not raw:
+        return False
+    return ("Р" in raw and "С" in raw) or ("Ð" in raw and "Ñ" in raw)
+
+
+def _repair_payload_text_ru(value: object) -> object:
+    if isinstance(value, str):
+        return _repair_mojibake_ru(value)
+    if isinstance(value, list):
+        return [_repair_payload_text_ru(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_repair_payload_text_ru(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _repair_payload_text_ru(v) for k, v in value.items()}
+    return value
 
 
 class _MojibakeLogFilter(logging.Filter):
@@ -923,12 +986,17 @@ class Trader:
         self._ticker_cache: Dict[str, Tuple[float, float]] = {}
         self._candidate_symbols_cache: list[str] = []
         self._candidate_symbols_cache_ts: float = 0.0
+        self._candidate_universe_meta: Dict[str, object] = {}
         self._markets_cache: Dict[str, object] = {}
         self._markets_cache_ts: float = 0.0
         self._markets_ttl_sec: float = 300.0
         self._tickers24_cache: Dict[str, object] = {}
         self._tickers24_cache_ts: float = 0.0
         self._tickers24_ttl_sec: float = 18.0 if bool(getattr(self.config, "LIVE_FAST_LOOP", False)) else 45.0
+        self._single_ticker_rest_backoff_until_ts: Dict[str, float] = {}
+        self._single_ticker_rest_fail_count: Dict[str, int] = {}
+        self._tickers24_rest_backoff_until_ts: float = 0.0
+        self._tickers24_rest_fail_count: int = 0
         # Keep ticker cache short so live mode tracks market moves with low lag.
         if (not self.config.DRY_RUN) and bool(getattr(self.config, "LIVE_FAST_LOOP", False)):
             active_sleep = max(0.8, float(getattr(self.config, "LIVE_ACTIVE_SLEEP_SEC", 1.2)))
@@ -939,6 +1007,7 @@ class Trader:
         self._api_error_events: deque[float] = deque(maxlen=512)
         self._last_ohlcv_cache: Dict[str, Tuple[float, list[list[float]]]] = {}
         self._last_position_cache: Dict[str, Dict[str, object]] = {}
+        self._io_timeout_warn_ts: Dict[str, float] = {}
         self._hot_state: Dict[str, object] = {}
         self._hot_state_lock = threading.Lock()
         self.exchange = self._create_exchange()
@@ -970,13 +1039,39 @@ class Trader:
             raise RuntimeError("Set MEXC_API_KEY and MEXC_API_SECRET.")
 
         exchange = MexcSync(exchange_config)
+        if self.config.TRADE_MARKET == "spot":
+            # The bundled MEXC adapter merges spot + swap markets in fetch_markets(),
+            # which can hit contract-detail timeouts even for spot-only runs.
+            exchange.fetch_markets = lambda params={}: exchange.fetch_spot_markets(params)
         if hasattr(exchange, "load_time_difference"):
             try:
                 exchange.load_time_difference()
             except Exception as e:
                 logging.warning("Не удалось загрузить разницу времени: %s", e)
-        exchange.load_markets()
+        try:
+            self._call_with_retries(
+                "load_markets_init_spot" if self.config.TRADE_MARKET == "spot" else "load_markets_init",
+                lambda: exchange.load_markets(),
+                retries=1,
+                base_sleep_sec=0.20,
+                retry_timeout_sec=max(1.2, float(self.config.CYCLE_IO_TIMEOUT_SEC) * 1.35),
+            )
+        except Exception as exc:
+            logging.warning("Стартовая загрузка рынков не удалась, продолжим с ленивой инициализацией. Ошибка: %s", exc)
         return exchange
+
+    def _ensure_exchange_markets_loaded(self, context: str = "load_markets_lazy") -> Dict[str, object]:
+        markets = getattr(self.exchange, "markets", None)
+        if isinstance(markets, dict) and markets:
+            return markets
+        loaded = self._call_with_retries(
+            context,
+            lambda: self.exchange.load_markets(),
+            retries=1,
+            base_sleep_sec=0.20,
+            retry_timeout_sec=max(1.0, float(self.config.CYCLE_IO_TIMEOUT_SEC) * 1.2),
+        )
+        return loaded if isinstance(loaded, dict) else {}
 
     def _symbol_for_market(self, symbol: str) -> str:
         sym = str(symbol or "").strip().upper()
@@ -1044,7 +1139,13 @@ class Trader:
         raise RuntimeError(f"API call failed without exception: {context}")
 
     def get_market(self, symbol: str) -> Dict[str, object]:
-        return self.exchange.market(self._symbol_for_market(symbol))
+        trade_symbol = self._symbol_for_market(symbol)
+        try:
+            self._ensure_exchange_markets_loaded(f"load_markets_for_market:{trade_symbol}")
+            return self.exchange.market(trade_symbol)
+        except Exception as exc:
+            logging.warning("Не удалось получить market для %s: %s", trade_symbol, exc)
+            return {}
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int, force_refresh: bool = False) -> list[list[float]]:
         trade_symbol = self._symbol_for_market(symbol)
@@ -1094,6 +1195,16 @@ class Trader:
                 ts, px = cached
                 if px > 0 and (now - ts) <= ttl:
                     return float(px)
+        rest_backoff_until = _safe_float(self._single_ticker_rest_backoff_until_ts.get(trade_symbol), 0.0)
+        if rest_backoff_until > now:
+            if ws_price > 0:
+                self._ticker_cache[trade_symbol] = (time.time(), ws_price)
+                return float(ws_price)
+            cached = self._ticker_cache.get(trade_symbol)
+            if isinstance(cached, tuple):
+                _, px = cached
+                if px > 0:
+                    return float(px)
         try:
             ticker = self._call_with_retries(
                 f"fetch_ticker:{trade_symbol}",
@@ -1103,9 +1214,14 @@ class Trader:
                 retry_timeout_sec=max(0.7, float(self.config.CYCLE_IO_TIMEOUT_SEC) * 0.8),
             )
             price = _safe_float(ticker.get("last"), 0.0)
+            self._single_ticker_rest_fail_count[trade_symbol] = 0
+            self._single_ticker_rest_backoff_until_ts.pop(trade_symbol, None)
         except Exception as exc:
             logging.warning("fetch_ticker failed for %s (%s), using fallback price.", trade_symbol, exc)
             price = 0.0
+            fail_count = int(self._single_ticker_rest_fail_count.get(trade_symbol, 0)) + 1
+            self._single_ticker_rest_fail_count[trade_symbol] = fail_count
+            self._single_ticker_rest_backoff_until_ts[trade_symbol] = now + min(25.0, 3.0 + (fail_count * 3.0))
             ws_fb = self.ws_feed.last_price(trade_symbol, max_age_sec=max(0.2, self.config.WS_MAX_AGE_SEC * 2.5))
             if ws_fb > 0:
                 price = float(ws_fb)
@@ -1208,7 +1324,16 @@ class Trader:
                 val = fut.result(timeout=timeout)
                 return val
             except FuturesTimeoutError:
-                logging.warning("I/O timeout in %s for %s (%.2fs). Using fallback.", name, trade_symbol, timeout)
+                warn_key = f"{name}:{trade_symbol}"
+                now_ts = time.time()
+                last_warn_ts = _safe_float(self._io_timeout_warn_ts.get(warn_key), 0.0)
+                if (now_ts - last_warn_ts) >= 90.0:
+                    logging.warning("I/O timeout in %s for %s (%.2fs). Using fallback.", name, trade_symbol, timeout)
+                    self._io_timeout_warn_ts[warn_key] = now_ts
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
                 return fallback
             except Exception as exc:
                 self._record_api_error(name, exc if isinstance(exc, Exception) else Exception(str(exc)))
@@ -1432,22 +1557,34 @@ class Trader:
         fast_cache_ttl = 12.0 if bool(getattr(self.config, "LIVE_FAST_LOOP", False)) else 25.0
         if self._candidate_symbols_cache and (now - self._candidate_symbols_cache_ts) <= fast_cache_ttl:
             return list(self._candidate_symbols_cache)
+        limit_cfg = int(_safe_float(getattr(self.config, "SYMBOL_SCAN_LIMIT", 20), 20.0))
+        effective_limit = max(4, min(30, limit_cfg if limit_cfg > 0 else 12))
         try:
             if self._markets_cache and (now - self._markets_cache_ts) <= self._markets_ttl_sec:
                 markets = self._markets_cache
             else:
-                markets = self._call_with_retries(
-                    "load_markets_reload",
-                    lambda: self.exchange.load_markets(True),
-                    retries=1,
-                    base_sleep_sec=0.20,
-                    retry_timeout_sec=max(1.0, float(self.config.CYCLE_IO_TIMEOUT_SEC) * 1.2),
-                )
+                # MEXC spot reload can hit noisy contract-detail paths; plain load is more stable here.
+                if self.config.TRADE_MARKET == "spot":
+                    markets = self._call_with_retries(
+                        "load_markets_spot",
+                        lambda: self.exchange.load_markets(),
+                        retries=1,
+                        base_sleep_sec=0.20,
+                        retry_timeout_sec=max(1.0, float(self.config.CYCLE_IO_TIMEOUT_SEC) * 1.2),
+                    )
+                else:
+                    markets = self._call_with_retries(
+                        "load_markets_reload",
+                        lambda: self.exchange.load_markets(True),
+                        retries=1,
+                        base_sleep_sec=0.20,
+                        retry_timeout_sec=max(1.0, float(self.config.CYCLE_IO_TIMEOUT_SEC) * 1.2),
+                    )
                 if isinstance(markets, dict):
                     self._markets_cache = markets
                     self._markets_cache_ts = now
         except (TypeError, Exception) as e:
-            logging.warning("Не удалось загрузить рынки с reload=True, используем fallback. Ошибка: %s", e)
+            logging.warning("Не удалось загрузить рынки, используем fallback. Ошибка: %s", e)
             markets = self._call_with_retries(
                 "load_markets_fallback",
                 lambda: self.exchange.load_markets(),
@@ -1463,6 +1600,11 @@ class Trader:
         try:
             if self._tickers24_cache and (now - self._tickers24_cache_ts) <= self._tickers24_ttl_sec:
                 tickers = self._tickers24_cache
+            elif self._tickers24_rest_backoff_until_ts > now:
+                tickers_failed = True
+                if self._tickers24_cache and (now - self._tickers24_cache_ts) <= max(180.0, self._tickers24_ttl_sec * 6.0):
+                    tickers = self._tickers24_cache
+                    tickers_failed = False
             else:
                 tickers = self._call_with_retries(
                     "fetch_tickers",
@@ -1474,57 +1616,80 @@ class Trader:
                 if isinstance(tickers, dict) and tickers:
                     self._tickers24_cache = tickers
                     self._tickers24_cache_ts = now
+                    self._tickers24_rest_fail_count = 0
+                    self._tickers24_rest_backoff_until_ts = 0.0
         except Exception as exc:
             tickers_failed = True
             logging.warning("fetch_tickers timeout/failure, using fallback candidates: %s", exc)
+            self._tickers24_rest_fail_count = int(self._tickers24_rest_fail_count) + 1
+            self._tickers24_rest_backoff_until_ts = now + min(45.0, 6.0 + (self._tickers24_rest_fail_count * 4.0))
             if self._tickers24_cache and (now - self._tickers24_cache_ts) <= max(120.0, self._tickers24_ttl_sec * 4.0):
                 tickers = self._tickers24_cache
                 tickers_failed = False
 
         preferred: list[str] = []
         if self.config.PREFERRED_SPOT_SYMBOLS:
-            for sym in self.config.PREFERRED_SPOT_SYMBOLS[:5]:
+            for sym in self.config.PREFERRED_SPOT_SYMBOLS[:effective_limit]:
                 market = markets.get(sym)
                 if not self._is_spot_usdt_market(market):
                     continue
                 preferred.append(sym)
 
         if preferred and tickers_failed:
-            self._candidate_symbols_cache = list(preferred)
+            candidate_limit = min(effective_limit, max(4, len(preferred)))
+            selected = list(preferred[:candidate_limit])
+            self._candidate_universe_meta = {
+                "source": "preferred_fallback",
+                "base_limit": effective_limit,
+                "effective_limit": candidate_limit,
+                "preferred_count": len(preferred),
+                "market_count": len(markets) if isinstance(markets, dict) else 0,
+                "selected_count": len(selected),
+                "tickers_failed": True,
+            }
+            self._candidate_symbols_cache = list(selected)
             self._candidate_symbols_cache_ts = time.time()
-            return list(preferred)
+            return list(selected)
 
-        if preferred:
-            preferred_with_volume: list[Tuple[str, float]] = []
-            for sym in preferred:
-                ticker = tickers.get(sym, {})
-                quote_volume = _safe_float(ticker.get("quoteVolume"), 0.0)
-                preferred_with_volume.append((sym, quote_volume))
-            preferred_with_volume.sort(key=lambda x: x[1], reverse=True)
-            out = [sym for sym, _ in preferred_with_volume]
-            self._candidate_symbols_cache = list(out)
-            self._candidate_symbols_cache_ts = time.time()
-            return out
-
-        candidates: list[Tuple[str, float]] = []
+        preferred_set = {str(sym or "").upper().strip() for sym in preferred}
+        preferred_volume_floor = max(250000.0, float(self.config.MIN_QUOTE_VOLUME_USDT) * 0.35)
+        candidates: list[Tuple[str, int, float, float]] = []
         for sym, market in markets.items():
             if not self._is_spot_usdt_market(market):
                 continue
             ticker = tickers.get(sym, {})
             quote_volume = _safe_float(ticker.get("quoteVolume"), 0.0)
-            if quote_volume < self.config.MIN_QUOTE_VOLUME_USDT:
+            is_preferred = sym.upper() in preferred_set
+            min_quote_volume = preferred_volume_floor if is_preferred else float(self.config.MIN_QUOTE_VOLUME_USDT)
+            if quote_volume < min_quote_volume:
                 continue
-            candidates.append((sym, quote_volume))
+            priority = 1 if is_preferred else 0
+            pct_move = abs(_safe_float(ticker.get("percentage"), 0.0))
+            activity_score = min(30.0, pct_move) * 0.45 + math.log10(max(1.0, quote_volume))
+            candidates.append((sym, priority, activity_score, quote_volume))
 
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        
-        limit = self.config.SYMBOL_SCAN_LIMIT
-        # If scan limit is not positive, use a default of 5. Otherwise, use the user's limit but cap it at 5.
-        effective_limit = 5 if limit <= 0 else min(limit, 5)
-        out = [sym for sym, _ in candidates[:effective_limit]]
+        candidates.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+        candidate_limit = effective_limit
+        if tickers_failed:
+            candidate_limit = min(candidate_limit, max(4, len(preferred) if preferred else 4))
+        elif self._tickers24_rest_backoff_until_ts > now:
+            candidate_limit = min(candidate_limit, max(4, effective_limit - 1))
+        elif bool(getattr(self.config, "LIVE_FAST_LOOP", False)):
+            candidate_limit = min(candidate_limit, max(4, effective_limit - 1))
+
+        out = [sym for sym, _, _, _ in candidates[:candidate_limit]]
         if out:
             self._candidate_symbols_cache = list(out)
             self._candidate_symbols_cache_ts = time.time()
+            self._candidate_universe_meta = {
+                "source": "tickers24",
+                "base_limit": effective_limit,
+                "effective_limit": candidate_limit,
+                "preferred_count": len(preferred),
+                "market_count": len(markets) if isinstance(markets, dict) else 0,
+                "selected_count": len(out),
+                "tickers_failed": bool(tickers_failed),
+            }
             return out
         # Last-resort fallback: use recent cache for a few minutes.
         if self._candidate_symbols_cache and (time.time() - self._candidate_symbols_cache_ts) <= 600:
@@ -1689,6 +1854,14 @@ class Bot:
             "live_weight": 0.0,
             "updated_ts": 0.0,
         }
+        self.confidence_calibration_state: Dict[str, object] = {
+            "overall_ema_score": 0.50,
+            "overall_ema_margin": 0.0,
+            "bucket_stats": {},
+            "updated_ts": 0.0,
+        }
+        self.missed_opportunity_feedback: Dict[str, Dict[str, float]] = {}
+        self.pending_opportunity_setups: deque[Dict[str, object]] = deque(maxlen=160)
         self.recent_trade_scores: deque[float] = deque(maxlen=120)
         self.recent_cycle_feedback: deque[Dict[str, object]] = deque(maxlen=220)
         self.recent_decision_scores: deque[float] = deque(maxlen=220)
@@ -2025,6 +2198,10 @@ class Bot:
         price: float,
         usdt_free: float,
         base_free: float,
+        signal_reason: str = "",
+        signal_explainer: list[str] | None = None,
+        no_entry_reasons: list[str] | None = None,
+        data_quality_score: float = 0.0,
     ) -> None:
         evt = str(event or "").strip()
         if not evt:
@@ -2063,6 +2240,10 @@ class Bot:
                 "price": float(price),
                 "usdt_free": float(usdt_free),
                 "base_free": float(base_free),
+                "signal_reason": str(signal_reason or ""),
+                "signal_explainer": [str(x).strip() for x in (signal_explainer or []) if str(x).strip()][:8],
+                "no_entry_reasons": [str(x).strip() for x in (no_entry_reasons or []) if str(x).strip()][:8],
+                "data_quality_score": float(_clamp(data_quality_score, 0.0, 1.0)),
                 "dry_run": bool(self.config.DRY_RUN),
                 "mode": (
                     "training"
@@ -2072,12 +2253,132 @@ class Bot:
                 "bot_pid": os.getpid(),
                 "session_id": self._run_session_id,
             }
+            payload = _repair_payload_text_ru(payload)
             ap = self._audit_log_path()
             ap.parent.mkdir(parents=True, exist_ok=True)
             with ap.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            now_ts = time.time()
+            last_warn_ts = _safe_float(getattr(self, "_last_audit_write_error_ts", 0.0), 0.0)
+            if now_ts - last_warn_ts >= 60.0:
+                logging.warning("Audit write failed: %s", exc)
+                self._last_audit_write_error_ts = now_ts
+
+    def _compute_data_quality_score(
+        self,
+        *,
+        market_data_stale: bool,
+        market_data_stale_sec: float,
+        ticker_rest_backoff_sec: float,
+        tickers24_rest_backoff_sec: float,
+        ticker_rest_fail_count: float,
+        tickers24_rest_fail_count: float,
+        market_volatility: float,
+        regime_flags: list[str],
+        universe_tickers_failed: bool,
+    ) -> float:
+        score = 1.0
+        flags = {str(x).strip().lower() for x in (regime_flags or []) if str(x).strip()}
+        stale_sec = max(0.0, _safe_float(market_data_stale_sec, 0.0))
+        if market_data_stale:
+            score -= 0.42
+        score -= min(0.24, stale_sec / 90.0)
+        score -= min(0.18, max(0.0, _safe_float(ticker_rest_backoff_sec, 0.0)) / 60.0)
+        score -= min(0.16, max(0.0, _safe_float(tickers24_rest_backoff_sec, 0.0)) / 60.0)
+        score -= min(0.10, max(0.0, _safe_float(ticker_rest_fail_count, 0.0)) * 0.015)
+        score -= min(0.10, max(0.0, _safe_float(tickers24_rest_fail_count, 0.0)) * 0.015)
+        if universe_tickers_failed:
+            score -= 0.12
+        vol = max(0.0, _safe_float(market_volatility, 0.0))
+        if vol >= 0.035:
+            score -= 0.12
+        elif vol >= 0.020:
+            score -= 0.06
+        if "anomaly" in flags:
+            score -= 0.08
+        if "low_liquidity" in flags:
+            score -= 0.08
+        return float(_clamp(score, 0.0, 1.0))
+
+    def _build_signal_explainer(
+        self,
+        *,
+        event: str,
+        ai_action: str,
+        ai_conf: float,
+        ai_conf_required: float,
+        ai_quality: float,
+        ai_quality_required: float,
+        expected_edge_pct: float,
+        min_expected_edge_pct: float,
+        buy_block_reasons: list[str],
+        market_data_stale: bool,
+        data_quality_score: float,
+        market_regime: str,
+        market_flags: list[str],
+        has_open_position: bool,
+    ) -> list[str]:
+        explainers: list[str] = []
+        flags = {str(x).strip().lower() for x in (market_flags or []) if str(x).strip()}
+        blocks = [str(x or "").strip().lower() for x in (buy_block_reasons or []) if str(x or "").strip()]
+        evt = str(event or "").strip().lower()
+        action = str(ai_action or "").strip().upper()
+
+        if has_open_position:
+            explainers.append("Позиция уже открыта: бот сопровождает сделку.")
+        elif market_data_stale:
+            explainers.append("Рыночные данные устарели: вход временно пропускается.")
+        elif data_quality_score < 0.55:
+            explainers.append(f"Качество данных низкое ({data_quality_score:.2f}): сигнал считается ненадёжным.")
+
+        if action and action not in {"LONG", "SHORT"}:
+            explainers.append(f"AI не дал рабочего направления входа ({action}).")
+
+        edge_margin = float(expected_edge_pct - min_expected_edge_pct)
+        if any("expected_edge" in r or "edge" in r for r in blocks):
+            explainers.append(
+                f"Ожидаемое преимущество слабое: {expected_edge_pct * 100.0:.2f}% при минимуме {min_expected_edge_pct * 100.0:.2f}%."
+            )
+        elif edge_margin > 0:
+            explainers.append(
+                f"Ожидаемое преимущество проходит порог с запасом {edge_margin * 100.0:.2f}%."
+            )
+
+        if any("quality" in r for r in blocks):
+            explainers.append(
+                f"Качество сигнала ниже порога: {ai_quality:.2f} при минимуме {ai_quality_required:.2f}."
+            )
+        if any("confidence" in r or "conf" in r for r in blocks):
+            explainers.append(
+                f"Уверенность AI ниже порога: {ai_conf:.2f} при минимуме {ai_conf_required:.2f}."
+            )
+        if any("mtf" in r for r in blocks):
+            explainers.append("Старший таймфрейм не подтвердил вход.")
+        if any("debounce" in r for r in blocks):
+            explainers.append("Сигнал слишком нестабилен: дебаунс ещё не пройден.")
+        if any("guard" in r or "pretrade:" in r for r in blocks):
+            explainers.append("Защитные фильтры риска заблокировали вход.")
+
+        if evt in {"buy", "training_buy_signal"} and not explainers:
+            explainers.append("Все основные фильтры прошли: бот открыл позицию.")
+        if evt in {"training_no_signal", "no_trade_signal", "entry_blocked"} and not explainers:
+            explainers.append("Подходящего сетапа для входа пока нет.")
+
+        regime_name = str(market_regime or "flat")
+        if ("low_vol" in flags or "low_volatility" in flags) and len(explainers) < 6:
+            explainers.append(f"Рынок сейчас вялый ({regime_name}): сильные входы встречаются реже.")
+        elif regime_name in {"range", "flat"} and len(explainers) < 6:
+            explainers.append(f"Режим рынка {regime_name}: бот ждёт более чистый импульс.")
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for item in explainers:
+            key = str(item).strip()
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(key)
+        return unique[:6]
 
     def _load_position_memory(self) -> None:
         if self.config.AI_TRAINING_MODE and self.config.DRY_RUN:
@@ -2410,6 +2711,42 @@ class Bot:
                     "live_weight": _safe_float(raw_shared_learning.get("live_weight"), 0.0),
                     "updated_ts": _safe_float(raw_shared_learning.get("updated_ts"), 0.0),
                 }
+            raw_conf_cal = payload.get("confidence_calibration_state", {})
+            if isinstance(raw_conf_cal, dict):
+                bucket_stats_raw = raw_conf_cal.get("bucket_stats", {})
+                bucket_stats: Dict[str, Dict[str, float]] = {}
+                if isinstance(bucket_stats_raw, dict):
+                    for k, v in bucket_stats_raw.items():
+                        bk = str(k or "").strip().lower()
+                        if not bk or not isinstance(v, dict):
+                            continue
+                        bucket_stats[bk] = {
+                            "ema_score": _safe_float(v.get("ema_score"), 0.50),
+                            "ema_margin": _safe_float(v.get("ema_margin"), 0.0),
+                            "count": _safe_float(v.get("count"), 0.0),
+                            "updated_ts": _safe_float(v.get("updated_ts"), 0.0),
+                        }
+                self.confidence_calibration_state = {
+                    "overall_ema_score": _safe_float(raw_conf_cal.get("overall_ema_score"), 0.50),
+                    "overall_ema_margin": _safe_float(raw_conf_cal.get("overall_ema_margin"), 0.0),
+                    "bucket_stats": bucket_stats,
+                    "updated_ts": _safe_float(raw_conf_cal.get("updated_ts"), 0.0),
+                }
+            raw_missed = payload.get("missed_opportunity_feedback", {})
+            if isinstance(raw_missed, dict):
+                restored_missed: Dict[str, Dict[str, float]] = {}
+                for k, v in raw_missed.items():
+                    mk = str(k or "").strip().upper()
+                    if not mk or not isinstance(v, dict):
+                        continue
+                    restored_missed[mk] = {
+                        "ema_good": _safe_float(v.get("ema_good"), 0.5),
+                        "ema_bad": _safe_float(v.get("ema_bad"), 0.5),
+                        "ema_move": _safe_float(v.get("ema_move"), 0.0),
+                        "count": _safe_float(v.get("count"), 0.0),
+                        "updated_ts": _safe_float(v.get("updated_ts"), 0.0),
+                    }
+                self.missed_opportunity_feedback = restored_missed
         except Exception as exc:
             logging.warning("Не удалось загрузить состояние risk guard: %s", exc)
 
@@ -2442,6 +2779,8 @@ class Bot:
                     "symbol_exec_slippage_ema_bps": dict(self.symbol_exec_slippage_ema_bps),
                     "symbol_exec_quality_ema": dict(self.symbol_exec_quality_ema),
                     "shared_learning_feedback": dict(self.shared_learning_feedback),
+                    "confidence_calibration_state": dict(self.confidence_calibration_state),
+                    "missed_opportunity_feedback": dict(self.missed_opportunity_feedback),
                 }
                 _write_json_atomic(path, payload)
         except Exception as exc:
@@ -2859,16 +3198,21 @@ class Bot:
         mode_label = "futures" if self.config.TRADE_MARKET == "futures" else "spot"
         self._register_trader_api_errors()
         # Early heartbeat so GUI/live monitor stays fresh even during long API calls.
+        busy_symbol = self.active_symbol or self.config.SYMBOL
+        prev_live = dict(self._last_live_status_payload) if isinstance(self._last_live_status_payload, dict) else {}
+        prev_busy_symbol = str(prev_live.get("symbol", "") or "").strip()
+        keep_prev_busy_quote = bool(prev_busy_symbol and (_symbol_key(prev_busy_symbol) == _symbol_key(busy_symbol)))
         self._write_live_status({
             "ts_utc": datetime.now(timezone.utc).isoformat(),
             "mode": mode_label,
             "cycle_index": cycle_index,
             "event": "cycle_busy",
-            "symbol": self.active_symbol or self.config.SYMBOL,
-            # Busy heartbeat: do not show stale quote from previous symbol.
-            "price": 0.0,
-            "sma": 0.0,
-            "deviation": 0.0,
+            "symbol": busy_symbol,
+            # Busy heartbeat keeps last known quote for the same symbol,
+            # but stays neutral on symbol switch to avoid cross-pair confusion.
+            "price": _safe_float(prev_live.get("price"), 0.0) if keep_prev_busy_quote else 0.0,
+            "sma": _safe_float(prev_live.get("sma"), 0.0) if keep_prev_busy_quote else 0.0,
+            "deviation": _safe_float(prev_live.get("deviation"), 0.0) if keep_prev_busy_quote else 0.0,
             "auto_symbol_selection": self.config.AUTO_SYMBOL_SELECTION,
             "ai_auto_risk": self.config.AI_AUTO_RISK,
             "dry_run": self.config.DRY_RUN,
@@ -3224,17 +3568,31 @@ class Bot:
         self.runtime_advisory = advisory_meta
         ai_entry_min_quality = self._param_f("AI_ENTRY_MIN_QUALITY", self.config.AI_ENTRY_MIN_QUALITY)
         ai_min_conf_required = self.config.AI_MIN_CONFIDENCE
+        training_runtime = bool(self.config.DRY_RUN and self.config.AI_TRAINING_MODE)
         flat_market_entry_filter = False
         micro_noise = self._micro_noise_score(ohlcv)
         regime_name = str(market_ctx.get("regime", "flat") or "flat").lower().strip()
         regime_flags_raw = market_ctx.get("flags", [])
         regime_flags = {str(x).lower().strip() for x in regime_flags_raw} if isinstance(regime_flags_raw, list) else set()
+        regime_bucket = self._market_regime_bucket(
+            regime_name,
+            regime_flags,
+            market_volatility=market_volatility,
+            anomaly_score=_safe_float(anomalies.get("anomaly_score"), 0.0) if isinstance(anomalies, dict) else 0.0,
+            momentum_speed=_safe_float(extra_features.get("momentum_speed"), 0.0) if isinstance(extra_features, dict) else 0.0,
+        )
+        if isinstance(self.runtime_market_ctx, dict):
+            self.runtime_market_ctx["bucket"] = regime_bucket
         symbol_regime_bias = self._symbol_regime_trade_bias(symbol, regime_name)
         symbol_live_bias = self._symbol_regime_live_bias(symbol, regime_name)
         cycle_bias = self._cycle_adaptive_bias(symbol, regime_name)
         execution_profile = self._execution_profile_bias()
         shared_learning_bias = self._shared_learning_bias()
         execution_stress = self._execution_stress_mode()
+        confidence_bias = self._confidence_calibration_bias(ai_conf)
+        missed_opportunity_bias = self._missed_opportunity_bias(symbol, regime_bucket)
+        anti_fragile_mode = self._anti_fragile_mode(symbol, regime_bucket)
+        no_trade_streak_cycles = int(max(0, self._no_trade_streak_cycles))
         tiny_balance_weak_market = (
             equity_usdt > 0
             and equity_usdt <= 5.0
@@ -3245,12 +3603,17 @@ class Bot:
         )
         if low_vol_flat_market:
             flat_market_entry_filter = True
-            # In live flat/low-vol markets require stronger quality/confidence, but keep it moderate.
-            ai_entry_min_quality = min(0.88, ai_entry_min_quality + 0.035)
-            ai_min_conf_required = min(0.91, ai_min_conf_required + 0.028)
+            # In live flat/low-vol markets require stronger quality/confidence.
+            # In paper-training we still tighten, but softer to avoid full dead-zones.
+            flat_quality_tighten = 0.020 if training_runtime else 0.035
+            flat_conf_tighten = 0.016 if training_runtime else 0.028
+            ai_entry_min_quality = min(0.88, ai_entry_min_quality + flat_quality_tighten)
+            ai_min_conf_required = min(0.91, ai_min_conf_required + flat_conf_tighten)
         if micro_noise >= 0.62:
-            ai_entry_min_quality = min(0.92, ai_entry_min_quality + 0.05)
-            ai_min_conf_required = min(0.94, ai_min_conf_required + 0.04)
+            noise_quality_tighten = 0.028 if training_runtime else 0.05
+            noise_conf_tighten = 0.022 if training_runtime else 0.04
+            ai_entry_min_quality = min(0.92, ai_entry_min_quality + noise_quality_tighten)
+            ai_min_conf_required = min(0.94, ai_min_conf_required + noise_conf_tighten)
         if short_model_weak and self.config.TRADE_MARKET == "futures":
             # When downside detector lags behind long quality, tighten entries.
             # For LONG signals we apply a softer penalty, because spot entries are long-only.
@@ -3283,15 +3646,26 @@ class Bot:
                 relax_conf *= 0.55
             ai_entry_min_quality = max(self.config.AI_ENTRY_MIN_QUALITY + 0.005, ai_entry_min_quality - relax_quality)
             ai_min_conf_required = max(self.config.AI_MIN_CONFIDENCE + 0.005, ai_min_conf_required - relax_conf)
-        if self.config.DRY_RUN and self.config.AI_TRAINING_MODE:
+        if regime_bucket == "flat_low_vol":
+            protective_pressure = 0.0
+            if self.loss_streak_live >= 2:
+                protective_pressure += min(0.040, 0.012 * float(self.loss_streak_live))
+            if _safe_float(symbol_live_bias.get("risk_mult"), 1.0) < 0.98:
+                protective_pressure += min(0.020, (1.0 - _safe_float(symbol_live_bias.get("risk_mult"), 1.0)) * 0.12)
+            if _safe_float(symbol_regime_bias.get("edge_delta"), 0.0) > 0:
+                protective_pressure += min(0.015, _safe_float(symbol_regime_bias.get("edge_delta"), 0.0) * 8.0)
+            if protective_pressure > 0:
+                ai_entry_min_quality = min(0.95, ai_entry_min_quality + protective_pressure)
+                ai_min_conf_required = min(0.95, ai_min_conf_required + min(0.030, protective_pressure * 0.75))
+        if training_runtime:
             # Training mode should collect more market episodes; keep live strictness untouched.
             ai_entry_min_quality = max(
-                self.config.AI_ENTRY_MIN_QUALITY - 0.06,
-                ai_entry_min_quality - 0.07,
+                self.config.AI_ENTRY_MIN_QUALITY - 0.10,
+                ai_entry_min_quality - 0.10,
             )
             ai_min_conf_required = max(
-                self.config.AI_MIN_CONFIDENCE - 0.06,
-                ai_min_conf_required - 0.06,
+                self.config.AI_MIN_CONFIDENCE - 0.08,
+                ai_min_conf_required - 0.08,
             )
         elif (not self.config.DRY_RUN) and (not self.config.AI_TRAINING_MODE):
             # Live mode: softer gate in weak market to reduce overblocking.
@@ -3315,6 +3689,9 @@ class Bot:
         ai_entry_min_quality = _clamp(
             ai_entry_min_quality
             + _safe_float(shared_learning_bias.get("quality_delta"), 0.0)
+            + _safe_float(confidence_bias.get("quality_delta"), 0.0)
+            + _safe_float(missed_opportunity_bias.get("quality_delta"), 0.0)
+            + _safe_float(anti_fragile_mode.get("quality_delta"), 0.0)
             + _safe_float(execution_stress.get("quality_delta"), 0.0),
             max(0.18, self.config.AI_ENTRY_MIN_QUALITY - 0.10),
             0.96,
@@ -3324,10 +3701,42 @@ class Bot:
             + _safe_float(cycle_bias.get("conf_delta"), 0.0)
             + _safe_float(execution_profile.get("conf_delta"), 0.0)
             + _safe_float(shared_learning_bias.get("conf_delta"), 0.0)
+            + _safe_float(confidence_bias.get("conf_delta"), 0.0)
+            + _safe_float(anti_fragile_mode.get("conf_delta"), 0.0)
             + _safe_float(execution_stress.get("conf_delta"), 0.0),
             max(0.18, self.config.AI_MIN_CONFIDENCE - 0.10),
             0.98,
         )
+        if training_runtime and not bool(market_ctx.get("dangerous", False)):
+            # Paper-training should see more near-miss episodes so the model learns from them.
+            ai_entry_min_quality = min(ai_entry_min_quality, max(0.34, self.config.AI_ENTRY_MIN_QUALITY - 0.11))
+            ai_min_conf_required = min(ai_min_conf_required, max(0.46, self.config.AI_MIN_CONFIDENCE - 0.10))
+        deadlock_soft_relax = 0.0
+        deadlock_conf_relax = 0.0
+        deadlock_debounce_relax = 0
+        if (
+            no_trade_streak_cycles >= (14 if training_runtime else 42)
+            and not bool(market_ctx.get("dangerous", False))
+            and regime_bucket in {"flat_low_vol", "trend", "range", "mixed", "flat"}
+        ):
+            extra_steps = max(0, (no_trade_streak_cycles - (14 if training_runtime else 42)) // (10 if training_runtime else 18))
+            deadlock_soft_relax = min(0.08 if training_runtime else 0.045, 0.012 + (extra_steps * (0.010 if training_runtime else 0.006)))
+            deadlock_conf_relax = min(0.07 if training_runtime else 0.04, 0.010 + (extra_steps * (0.009 if training_runtime else 0.005)))
+            if regime_bucket == "flat_low_vol":
+                deadlock_soft_relax *= 0.75
+                deadlock_conf_relax *= 0.75
+            if self.loss_streak_live >= 2:
+                deadlock_soft_relax *= 0.55
+                deadlock_conf_relax *= 0.55
+            ai_entry_min_quality = max(
+                0.30 if training_runtime else max(0.36, self.config.AI_ENTRY_MIN_QUALITY - 0.08),
+                ai_entry_min_quality - deadlock_soft_relax,
+            )
+            ai_min_conf_required = max(
+                0.42 if training_runtime else max(0.50, self.config.AI_MIN_CONFIDENCE - 0.07),
+                ai_min_conf_required - deadlock_conf_relax,
+            )
+            deadlock_debounce_relax = 1 + min(1, extra_steps // 2)
         ai_quality_ok = ai_entry_quality >= ai_entry_min_quality
         ai_gate_ok = bool(ai_signal) and ai_filter_ok and ai_conf >= ai_min_conf_required and ai_quality_ok
         mtf_pass, mtf_meta = self._mtf_confirmation(symbol)
@@ -3343,6 +3752,20 @@ class Bot:
                 and not bool(market_ctx.get("dangerous", False))
                 and ai_entry_quality >= (ai_entry_min_quality * 0.90)
                 and ai_conf >= (ai_min_conf_required * 0.90)
+            ):
+                mtf_soft_bypass = True
+            elif (
+                self.config.DRY_RUN
+                and self.config.AI_TRAINING_MODE
+                and no_trade_streak_cycles >= 12
+                and ai_action == "LONG"
+                and regime_bucket in {"flat_low_vol", "range", "flat", "mixed", "trend"}
+                and micro_noise < 0.72
+                and not bool(market_ctx.get("dangerous", False))
+                and ai_entry_quality >= max(0.34, ai_entry_min_quality * 0.84)
+                and ai_conf >= max(0.48, ai_min_conf_required * 0.86)
+                and _safe_float(mtf_meta.get("m5_trend"), 0.0) >= -0.0018
+                and _safe_float(mtf_meta.get("m15_trend"), 0.0) >= -0.0026
             ):
                 mtf_soft_bypass = True
             elif (
@@ -3441,11 +3864,36 @@ class Bot:
         )
         active_risk["fraction"] = max(
             self.config.AI_RISK_FRACTION_MIN,
-            active_risk["fraction"] * _safe_float(execution_stress.get("risk_mult"), 1.0),
+            active_risk["fraction"]
+            * _safe_float(execution_stress.get("risk_mult"), 1.0)
+            * _safe_float(missed_opportunity_bias.get("risk_mult"), 1.0)
+            * _safe_float(anti_fragile_mode.get("risk_mult"), 1.0),
+        )
+        active_risk["take_profit"] = max(
+            self.config.AI_TAKE_PROFIT_MIN,
+            min(self.config.AI_TAKE_PROFIT_MAX, active_risk["take_profit"] * _safe_float(anti_fragile_mode.get("tp_mult"), 1.0)),
+        )
+        active_risk["trailing_stop"] = max(
+            self.config.AI_TRAILING_STOP_MIN,
+            min(self.config.AI_TRAILING_STOP_MAX, active_risk["trailing_stop"] * _safe_float(anti_fragile_mode.get("ts_mult"), 1.0)),
+        )
+        active_risk["stop_loss"] = max(
+            self.config.AI_STOP_LOSS_MIN,
+            min(self.config.AI_STOP_LOSS_MAX, active_risk["stop_loss"] * _safe_float(anti_fragile_mode.get("sl_mult"), 1.0)),
+        )
+        active_risk, entry_tp_cap = self._apply_entry_tp_reachability_cap(
+            symbol=symbol,
+            has_open_position=has_open_position,
+            active_risk=active_risk,
+            market_ctx=market_ctx,
+            ai_signal=ai_signal,
+            atr_pct=atr_pct,
+            cycle_equity_usdt=equity_usdt,
         )
         active_risk, tp_adaptation = self._apply_open_position_tp_adaptation(
             symbol=symbol,
             has_open_position=has_open_position,
+            current_price=price,
             cycle_equity_usdt=equity_usdt,
             active_risk=active_risk,
             market_ctx=market_ctx,
@@ -3485,6 +3933,9 @@ class Bot:
                     tp_adaptation["entry_tp_to"] = float(active_risk["take_profit"])
                     tp_adaptation["entry_ts_from"] = float(old_ts)
                     tp_adaptation["entry_ts_to"] = float(active_risk["trailing_stop"])
+        if bool(entry_tp_cap.get("applied", False)):
+            tp_adaptation = dict(tp_adaptation)
+            tp_adaptation["entry_reachability_cap"] = dict(entry_tp_cap)
         post_time_stop_block = False
         post_time_stop_wait_candles = 0
         block_until_candle_ts = int(self.time_stop_buy_block_until_candle_ts.get(symbol.upper(), 0))
@@ -3548,9 +3999,9 @@ class Bot:
         ):
             # Small balance mode: avoid excessive dead-zones while keeping positive edge filter.
             min_expected_edge_pct = max(0.0012, min_expected_edge_pct - 0.00035)
-        if self.config.DRY_RUN and self.config.AI_TRAINING_MODE:
+        if training_runtime:
             # Looser edge floor in paper-training to avoid zero-trade regime.
-            min_expected_edge_pct = max(0.0012, min_expected_edge_pct - 0.0012)
+            min_expected_edge_pct = max(0.0007, min_expected_edge_pct - 0.0021)
         elif (not self.config.DRY_RUN) and (not self.config.AI_TRAINING_MODE):
             # Live mode: keep edge guard, but avoid dead periods in flat low-vol.
             min_expected_edge_pct = max(0.00145, min_expected_edge_pct - 0.00085)
@@ -3562,6 +4013,9 @@ class Bot:
             + _safe_float(cycle_bias.get("edge_delta"), 0.0)
             + _safe_float(shared_learning_bias.get("edge_delta"), 0.0),
         )
+        min_expected_edge_pct = max(0.0010, min_expected_edge_pct + _safe_float(confidence_bias.get("edge_delta"), 0.0))
+        min_expected_edge_pct = max(0.0010, min_expected_edge_pct + _safe_float(missed_opportunity_bias.get("edge_delta"), 0.0))
+        min_expected_edge_pct = max(0.0010, min_expected_edge_pct + _safe_float(anti_fragile_mode.get("edge_delta"), 0.0))
         min_expected_edge_pct = max(0.0010, min_expected_edge_pct + _safe_float(execution_profile.get("edge_delta"), 0.0))
         min_expected_edge_pct = max(0.0010, min_expected_edge_pct + _safe_float(execution_stress.get("edge_delta"), 0.0))
         if adaptive_cooldown_score >= 0.18:
@@ -3580,15 +4034,31 @@ class Bot:
         if (
             (not has_open_position)
             and (not bool(market_ctx.get("dangerous", False)))
-            and (self._no_trade_streak_cycles >= 40)
+            and (self._no_trade_streak_cycles >= (18 if training_runtime else 40))
             and (regime_name in {"flat", "range", "trend", "impulse"})
             and (ai_conf >= max(0.50, ai_min_conf_required * 0.88))
             and (ai_entry_quality >= max(0.40, ai_entry_min_quality * 0.84))
         ):
-            extra_steps = max(0, (self._no_trade_streak_cycles - 40) // 20)
-            deadlock_relax = min(0.0010, 0.00018 + (extra_steps * 0.00009))
-            floor_limit = 0.0012 if ((not self.config.DRY_RUN) and (not self.config.AI_TRAINING_MODE)) else 0.0010
+            extra_steps = max(0, (self._no_trade_streak_cycles - (18 if training_runtime else 40)) // (12 if training_runtime else 20))
+            deadlock_relax = min(0.00135 if training_runtime else 0.0010, 0.00018 + (extra_steps * (0.00014 if training_runtime else 0.00009)))
+            floor_limit = 0.0012 if ((not self.config.DRY_RUN) and (not self.config.AI_TRAINING_MODE)) else 0.0008
             min_expected_edge_pct = max(floor_limit, min_expected_edge_pct - deadlock_relax)
+        if (
+            training_runtime
+            and (not has_open_position)
+            and (not bool(market_ctx.get("dangerous", False)))
+            and ai_action == "LONG"
+            and ai_filter_ok
+            and ai_conf >= max(0.48, ai_min_conf_required * 0.84)
+            and ai_entry_quality >= max(0.34, ai_entry_min_quality * 0.82)
+            and regime_bucket in {"flat_low_vol", "range", "flat", "mixed", "trend"}
+        ):
+            training_edge_relax = 0.00022
+            if no_trade_streak_cycles >= 14:
+                training_edge_relax += min(0.00055, (no_trade_streak_cycles - 14) * 0.00003)
+            if regime_bucket == "flat_low_vol":
+                training_edge_relax *= 0.85
+            min_expected_edge_pct = max(0.0007, min_expected_edge_pct - training_edge_relax)
         expected_edge_ok = expected_edge_pct >= min_expected_edge_pct
         self._update_regime_edge_autotune(
             regime=regime_name,
@@ -3642,10 +4112,19 @@ class Bot:
         debounce_required += int(_safe_float(symbol_live_bias.get("debounce_delta"), 0.0))
         debounce_required += int(_safe_float(execution_profile.get("debounce_delta"), 0.0))
         signal_debounce_required = max(1, min(4, debounce_required))
-        if self.config.DRY_RUN and self.config.AI_TRAINING_MODE:
+        if training_runtime:
             signal_debounce_required = max(1, signal_debounce_required - 1)
+            if (
+                ai_action == "LONG"
+                and not bool(market_ctx.get("dangerous", False))
+                and ai_conf >= max(0.48, ai_min_conf_required * 0.90)
+                and ai_entry_quality >= max(0.36, ai_entry_min_quality * 0.88)
+            ):
+                signal_debounce_required = max(1, signal_debounce_required - 1)
         elif (not self.config.DRY_RUN) and (not self.config.AI_TRAINING_MODE):
             signal_debounce_required = max(1, signal_debounce_required - 1)
+        if deadlock_debounce_relax > 0:
+            signal_debounce_required = max(1, signal_debounce_required - deadlock_debounce_relax)
         debounce_action = ""
         if ai_action == "LONG":
             debounce_action = "LONG"
@@ -3775,6 +4254,38 @@ class Bot:
             "atr_pct": atr_pct,
             "tp_adaptation": dict(tp_adaptation),
         }
+        universe_meta = dict(getattr(self.trader, "_candidate_universe_meta", {}) or {})
+        ticker_rest_backoff_sec = max(
+            0.0,
+            _safe_float(
+                self.trader._single_ticker_rest_backoff_until_ts.get(self.trader._symbol_for_market(symbol), 0.0),
+                0.0,
+            ) - time.time(),
+        ) if hasattr(self.trader, "_single_ticker_rest_backoff_until_ts") else 0.0
+        ticker_rest_fail_count = _safe_float(
+            getattr(self.trader, "_single_ticker_rest_fail_count", {}).get(self.trader._symbol_for_market(symbol), 0),
+            0.0,
+        ) if hasattr(self.trader, "_single_ticker_rest_fail_count") else 0.0
+        tickers24_rest_backoff_sec = max(
+            0.0,
+            _safe_float(getattr(self.trader, "_tickers24_rest_backoff_until_ts", 0.0), 0.0) - time.time(),
+        )
+        tickers24_rest_fail_count = _safe_float(getattr(self.trader, "_tickers24_rest_fail_count", 0), 0.0)
+        data_quality_score = self._compute_data_quality_score(
+            market_data_stale=bool(market_data_stale),
+            market_data_stale_sec=_safe_float(market_data_stale_sec, 0.0),
+            ticker_rest_backoff_sec=ticker_rest_backoff_sec,
+            tickers24_rest_backoff_sec=tickers24_rest_backoff_sec,
+            ticker_rest_fail_count=ticker_rest_fail_count,
+            tickers24_rest_fail_count=tickers24_rest_fail_count,
+            market_volatility=_safe_float(market_volatility, 0.0),
+            regime_flags=regime_flags,
+            universe_tickers_failed=bool(universe_meta.get("tickers_failed", False)),
+        )
+        data_quality_floor = 0.46 if training_runtime else 0.62
+        if bool(market_ctx.get("dangerous", False)):
+            data_quality_floor = max(data_quality_floor, 0.68 if training_runtime else 0.76)
+        data_quality_low = bool(data_quality_score < data_quality_floor)
 
         buy_intent = bool(
             (buy_trigger or dust_recovery_buy)
@@ -3790,6 +4301,7 @@ class Bot:
             is_short_spot_block=(self.config.TRADE_MARKET != "futures" and ai_enabled and ai_action == "SHORT" and not has_open_position),
             market_noise_high=(micro_noise >= 0.70),
             market_data_stale=market_data_stale,
+            data_quality_low=data_quality_low,
             expected_edge_ok=expected_edge_ok,
             short_model_weak_block=(
                 self.config.TRADE_MARKET == "futures"
@@ -3933,9 +4445,24 @@ class Bot:
             self._last_trade_event_ts = time.time()
         elif event in no_trade_events:
             self._no_trade_streak_cycles = min(5000, int(self._no_trade_streak_cycles) + 1)
+        self._refresh_missed_opportunities(symbol, price, latest_candle_ts)
+        self._register_missed_opportunity_candidate(
+            symbol=symbol,
+            regime_bucket=regime_bucket,
+            event=event,
+            ai_action=ai_action,
+            ai_conf=ai_conf,
+            ai_quality=ai_entry_quality,
+            expected_edge_pct=expected_edge_pct,
+            min_expected_edge_pct=min_expected_edge_pct,
+            price=price,
+            latest_candle_ts=latest_candle_ts,
+            buy_block_reasons=buy_block_reasons,
+        )
         self._update_cycle_feedback(
             symbol=symbol,
             regime=regime_name,
+            regime_bucket=regime_bucket,
             event=event,
             buy_block_reasons=buy_block_reasons,
             ai_quality=ai_entry_quality,
@@ -3957,14 +4484,32 @@ class Bot:
                 str(runtime_recover.get("reason", "") or "-"),
             )
 
+        normalized_buy_block_reasons = sorted({str(r or "").strip() for r in buy_block_reasons if str(r or "").strip()})
+        buy_block_summary = ", ".join(normalized_buy_block_reasons[:3]) if normalized_buy_block_reasons else ""
+        signal_explainer = self._build_signal_explainer(
+            event=event,
+            ai_action=ai_action,
+            ai_conf=ai_conf,
+            ai_conf_required=ai_min_conf_required,
+            ai_quality=ai_entry_quality,
+            ai_quality_required=ai_entry_min_quality,
+            expected_edge_pct=expected_edge_pct,
+            min_expected_edge_pct=min_expected_edge_pct,
+            buy_block_reasons=normalized_buy_block_reasons,
+            market_data_stale=bool(market_data_stale),
+            data_quality_score=data_quality_score,
+            market_regime=str(market_ctx.get("regime", "flat")),
+            market_flags=regime_flags,
+            has_open_position=bool(base_free > 0),
+        )
+
         if event in {"entry_blocked", "risk_guard_blocked"}:
             if guard_reason:
                 msg = f"guard:{guard_reason}"
                 text = f"Покупка заблокирована risk guard: {guard_reason}"
             else:
-                normalized_reasons = sorted({str(r or "").strip() for r in buy_block_reasons if str(r or "").strip()})
-                primary_reason = normalized_reasons[0] if normalized_reasons else "unknown"
-                reasons_text = ",".join(normalized_reasons) if normalized_reasons else "unknown"
+                primary_reason = normalized_buy_block_reasons[0] if normalized_buy_block_reasons else "unknown"
+                reasons_text = ",".join(normalized_buy_block_reasons) if normalized_buy_block_reasons else "unknown"
                 # Use stable signature for throttling to avoid log spam when reasons order/value jitter changes.
                 msg = f"entry:{primary_reason}"
                 text = f"Покупка заблокирована фильтрами входа: {reasons_text}"
@@ -4051,6 +4596,10 @@ class Bot:
             price=price,
             usdt_free=usdt_free,
             base_free=base_free,
+            signal_reason=(signal_explainer[0] if signal_explainer else audit_reason),
+            signal_explainer=signal_explainer,
+            no_entry_reasons=normalized_buy_block_reasons,
+            data_quality_score=data_quality_score,
         )
         recent_decision_quality = 0.0
         trade_quality = 0.0
@@ -4067,6 +4616,7 @@ class Bot:
             recent_decision_quality = trade_quality
         regime_bias_runtime = self._regime_trade_bias(str(market_ctx.get("regime", "flat")))
         stage_profile["cycle_ms"] = round((time.perf_counter() - cycle_t0) * 1000.0, 1)
+        universe_meta = dict(getattr(self.trader, "_candidate_universe_meta", {}) or {})
         self._write_live_status({
             "ts_utc": datetime.now(timezone.utc).isoformat(),
             "mode": mode_label,
@@ -4078,6 +4628,11 @@ class Bot:
             "ai_auto_risk": self.config.AI_AUTO_RISK,
             "universe_total": universe_total,
             "universe_scanned": universe_scanned,
+            "universe_source": str(universe_meta.get("source", "") or ""),
+            "universe_effective_limit": int(_safe_float(universe_meta.get("effective_limit"), 0.0)),
+            "universe_preferred_count": int(_safe_float(universe_meta.get("preferred_count"), 0.0)),
+            "universe_selected_count": int(_safe_float(universe_meta.get("selected_count"), 0.0)),
+            "universe_tickers_failed": bool(universe_meta.get("tickers_failed", False)),
             "price": price,
             "sma": sma,
             "deviation": deviation,
@@ -4129,13 +4684,26 @@ class Bot:
             "signal_debounce_pass": signal_debounce_pass,
             "signal_debounce_mode": signal_debounce_mode,
             "no_trade_streak_cycles": int(self._no_trade_streak_cycles),
+            "deadlock_soft_relax": float(deadlock_soft_relax),
+            "deadlock_conf_relax": float(deadlock_conf_relax),
+            "deadlock_debounce_relax": int(deadlock_debounce_relax),
             "last_trade_event_age_sec": (0.0 if self._last_trade_event_ts <= 0 else max(0.0, time.time() - self._last_trade_event_ts)),
             "symbol_internal_cooldown_remaining_sec": symbol_internal_cooldown_sec,
             "adaptive_symbol_cooldown": dict(adaptive_symbol_cooldown),
             "buy_block_reasons": buy_block_reasons,
+            "buy_block_reason_count": len(normalized_buy_block_reasons),
+            "buy_block_summary": buy_block_summary,
+            "ticker_rest_backoff_sec": ticker_rest_backoff_sec,
+            "ticker_rest_fail_count": ticker_rest_fail_count,
+            "tickers24_rest_backoff_sec": tickers24_rest_backoff_sec,
+            "tickers24_rest_fail_count": tickers24_rest_fail_count,
             "market_regime": str(market_ctx.get("regime", "flat")),
+            "market_regime_bucket": str(regime_bucket),
             "market_flags": market_ctx.get("flags", []),
             "market_dangerous": bool(market_ctx.get("dangerous", False)),
+            "data_quality_score": float(data_quality_score),
+            "signal_explainer": signal_explainer,
+            "signal_reason": (signal_explainer[0] if signal_explainer else audit_reason),
             "overlay_partial_exit_fraction": overlay_decision.partial_exit_fraction,
             "overlay_partial_reason": overlay_decision.partial_reason,
             "overlay_breakeven_armed": overlay_decision.breakeven_armed,
@@ -4147,6 +4715,9 @@ class Bot:
             "adaptive_last_event": dict(self.runtime_adaptation),
             "runtime_recover": dict(runtime_recover),
             "shared_learning_bias": dict(shared_learning_bias),
+            "confidence_bias": dict(confidence_bias),
+            "missed_opportunity_bias": dict(missed_opportunity_bias),
+            "anti_fragile_mode": dict(anti_fragile_mode),
             "execution_stress": dict(execution_stress),
             "regime_trade_feedback": dict(self.regime_trade_feedback.get(str(market_ctx.get("regime", "flat")).strip().lower(), {})),
             "regime_trade_bias": dict(regime_bias_runtime),
@@ -4315,6 +4886,20 @@ class Bot:
                 self._last_symbol_scan_result = (fallback, len(symbols), 0)
                 return fallback, len(symbols), 0
 
+            effective_limit = max(
+                4,
+                min(
+                    30,
+                    min(
+                        len(symbols),
+                        int(_safe_float(getattr(self.config, "SYMBOL_SCAN_LIMIT", max(len(symbols), 4)), float(max(len(symbols), 4)))),
+                    ),
+                ),
+            )
+            preferred_rank = {
+                str(sym or "").upper().strip(): idx
+                for idx, sym in enumerate(self.config.PREFERRED_SPOT_SYMBOLS[:effective_limit])
+            }
             best_symbol, best_score, scanned = non_quarantined[0], -1.0, 0
             has_valid_scored_candidate = False
             for sym in non_quarantined:
@@ -4327,6 +4912,12 @@ class Bot:
                     ohlcv = self.trader.fetch_ohlcv(sym, self.config.TIMEFRAME, self.config.AI_LOOKBACK)
                     
                     score = -1.0
+                    sym_key = str(sym or "").upper().strip()
+                    pref_idx = preferred_rank.get(sym_key, effective_limit + 2)
+                    pref_bonus = max(0.0, (effective_limit - pref_idx)) * 0.045
+                    exec_quality_ema = _clamp(_safe_float(self.symbol_exec_quality_ema.get(sym_key, 0.50), 0.50), 0.0, 1.0)
+                    quality_ema = _safe_float(self.symbol_quality_ema.get(sym_key, 0.0), 0.0)
+                    loss_streak = int(_safe_float(self.symbol_loss_streak.get(sym_key, 0.0), 0.0))
                     if self.ai_engine:
                         sig = self.ai_engine.predict(ohlcv, sym)
                         sig_conf = sig.calibrated_confidence if sig.calibrated_confidence > 0 else sig.confidence
@@ -4339,33 +4930,51 @@ class Bot:
                         ):
                             score = sig.score
                             # Internal pair quality memory: prefer symbols with better recent realized quality.
-                            score += _safe_float(self.symbol_quality_ema.get(sym.upper(), 0.0), 0.0) * 14.0
+                            score += quality_ema * 14.0
+                            score += max(0.0, exec_quality_ema - 0.50) * 1.35
+                            score += pref_bonus
+                            score -= min(1.6, loss_streak * 0.30)
                             regime_local = "flat"
                             try:
                                 market_ctx_local = self.adaptive_agent.detect_market_regime(ohlcv)
                                 regime_local = str(market_ctx_local.get("regime", "flat") or "flat").lower().strip()
                             except Exception:
                                 regime_local = "flat"
+                                market_ctx_local = {}
+                            regime_bucket_local = self._market_regime_bucket(
+                                regime_local,
+                                market_ctx_local.get("flags", []) if isinstance(market_ctx_local, dict) else [],
+                            )
                             regime_bias = self._regime_trade_bias(regime_local)
                             symbol_regime_bias = self._symbol_regime_trade_bias(sym, regime_local)
                             symbol_live_bias = self._symbol_regime_live_bias(sym, regime_local)
                             symbol_exec_bias = self._symbol_execution_bias(sym)
+                            missed_bias = self._missed_opportunity_bias(sym, regime_bucket_local)
+                            anti_fragile = self._anti_fragile_mode(sym, regime_bucket_local)
                             score -= max(0.0, _safe_float(regime_bias.get("exit_bias"), 0.0)) * 0.90
                             score += max(0.0, 1.0 - _safe_float(regime_bias.get("edge_mult"), 1.0)) * 0.35
                             score -= max(0.0, _safe_float(symbol_regime_bias.get("edge_delta"), 0.0)) * 1200.0
                             score -= max(0.0, _safe_float(symbol_live_bias.get("edge_delta"), 0.0)) * 1000.0
                             score -= max(0.0, _safe_float(symbol_live_bias.get("quality_delta"), 0.0)) * 18.0
+                            score -= max(0.0, _safe_float(missed_bias.get("edge_delta"), 0.0)) * 1050.0
+                            score += max(0.0, -_safe_float(missed_bias.get("edge_delta"), 0.0)) * 560.0
                             score += max(0.0, _safe_float(symbol_live_bias.get("risk_mult"), 1.0) - 1.0) * 1.8
                             score -= max(0, int(_safe_float(symbol_live_bias.get("debounce_delta"), 0.0))) * 0.18
                             score -= max(0.0, _safe_float(symbol_exec_bias.get("edge_delta"), 0.0)) * 1300.0
                             score += max(0.0, _safe_float(symbol_exec_bias.get("risk_mult"), 1.0) - 1.0) * 1.6
                             score += max(0.0, _safe_float(symbol_exec_bias.get("exec_quality"), 0.5) - 0.5) * 1.9
                             score -= max(0.0, _safe_float(symbol_exec_bias.get("slippage_bps"), 0.0) - 2.0) * 0.015
+                            score -= max(0.0, _safe_float(anti_fragile.get("edge_delta"), 0.0)) * 820.0
+                            score += max(0.0, _safe_float(anti_fragile.get("risk_mult"), 1.0) - 1.0) * 1.4
                     else:
                         price, sma = self._price_sma_from_ohlcv(ohlcv)
                         buy, _, dev = self._get_sma_signal(price, sma)
                         if buy:
                             score = dev
+                            score += pref_bonus
+                            score += max(0.0, exec_quality_ema - 0.50) * 0.55
+                            score += quality_ema * 6.0
+                            score -= min(1.1, loss_streak * 0.22)
                     
                     if score > best_score:
                         best_score, best_symbol = score, sym
@@ -4376,10 +4985,18 @@ class Bot:
                     continue
 
             if not has_valid_scored_candidate and non_quarantined:
-                # Avoid sticky first-symbol bias (often BTC) when all signals are weak/blocked.
-                rr_idx = self._symbol_rr_index % len(non_quarantined)
-                best_symbol = non_quarantined[rr_idx]
-                self._symbol_rr_index = (rr_idx + 1) % len(non_quarantined)
+                # When all signals are weak, prefer the healthiest/liquid preferred symbol instead of blind round-robin.
+                fallback_ranked = sorted(
+                    non_quarantined,
+                    key=lambda sym: (
+                        preferred_rank.get(str(sym or "").upper().strip(), effective_limit + 2),
+                        -_clamp(_safe_float(self.symbol_exec_quality_ema.get(str(sym or "").upper().strip(), 0.50), 0.50), 0.0, 1.0),
+                        -_safe_float(self.symbol_quality_ema.get(str(sym or "").upper().strip(), 0.0), 0.0),
+                        int(_safe_float(self.symbol_loss_streak.get(str(sym or "").upper().strip(), 0.0), 0.0)),
+                        str(sym or ""),
+                    ),
+                )
+                best_symbol = fallback_ranked[0]
             else:
                 self._symbol_rr_index = (self._symbol_rr_index + 1) % max(1, len(non_quarantined))
             self._last_symbol_scan_ts = now_ts
@@ -4539,6 +5156,84 @@ class Bot:
         self.symbol_exec_quality_ema[sym] = (1.0 - gamma) * prev_exec_q + gamma * exec_quality_score
 
     @staticmethod
+    def _trade_learning_outcome(
+        *,
+        pnl_pct_net: float,
+        entry_quality: float,
+        entry_edge: float,
+        exit_reason: str,
+        duration_sec: float,
+    ) -> dict[str, float | str]:
+        exit_reason_norm = str(exit_reason or "").strip().lower()
+        pnl_clamped = max(-0.03, min(0.03, float(pnl_pct_net)))
+        win_now = 1.0 if pnl_pct_net > 0 else 0.0
+        quality = _clamp(entry_quality, 0.0, 1.0)
+        edge = max(-0.01, min(0.03, float(entry_edge)))
+        duration_sec = max(0.0, float(duration_sec))
+
+        exit_eff_now = 0.50
+        bad_entry = 0.0
+        tp_unreachable = 0.0
+        if exit_reason_norm in {"take_profit", "trailing_stop"}:
+            exit_eff_now = 1.0
+        elif exit_reason_norm in {"smart_stagnation_exit", "stall_exit"}:
+            exit_eff_now = 0.65 if pnl_pct_net >= 0 else 0.26
+            if pnl_pct_net < 0:
+                tp_unreachable = 1.0
+                bad_entry = 0.75
+        elif exit_reason_norm in {"stop_loss"}:
+            exit_eff_now = 0.12 if pnl_pct_net < 0 else 0.42
+            if pnl_pct_net < 0:
+                bad_entry = 1.0
+                if edge >= 0.0014 and quality >= 0.52:
+                    tp_unreachable = 0.65
+        elif exit_reason_norm in {"time_stop", "ai_quality_fade"}:
+            exit_eff_now = 0.18 if pnl_pct_net < 0 else 0.44
+            if pnl_pct_net < 0:
+                bad_entry = 0.62
+                if edge >= 0.0012:
+                    tp_unreachable = 0.55
+
+        if pnl_pct_net < 0 and quality < 0.48:
+            bad_entry = max(bad_entry, 0.72)
+        if pnl_pct_net < 0 and edge < 0.0010:
+            bad_entry = max(bad_entry, 0.84)
+        if pnl_pct_net > 0 and exit_reason_norm in {"take_profit", "trailing_stop"}:
+            good_entry = 1.0
+        else:
+            good_entry = _clamp((win_now * 0.72) + (max(0.0, pnl_clamped) * 7.0) + (exit_eff_now * 0.14), 0.0, 1.0)
+
+        if duration_sec <= 1200 and pnl_pct_net < 0 and exit_reason_norm in {"smart_stagnation_exit", "stall_exit"}:
+            tp_unreachable = max(tp_unreachable, 0.78)
+
+        score_now = _clamp(
+            (good_entry * 0.52)
+            + (exit_eff_now * 0.16)
+            + (max(-0.03, min(0.03, pnl_pct_net)) * 6.5)
+            - (bad_entry * 0.34)
+            - (tp_unreachable * 0.22),
+            0.0,
+            1.0,
+        )
+        return {
+            "score": float(score_now),
+            "win": float(win_now),
+            "exit_efficiency": float(_clamp(exit_eff_now, 0.0, 1.0)),
+            "good_entry": float(_clamp(good_entry, 0.0, 1.0)),
+            "bad_entry": float(_clamp(bad_entry, 0.0, 1.0)),
+            "tp_unreachable": float(_clamp(tp_unreachable, 0.0, 1.0)),
+            "label": (
+                "good_entry"
+                if good_entry >= 0.72 and bad_entry < 0.35
+                else "tp_unreachable"
+                if tp_unreachable >= 0.60
+                else "bad_entry"
+                if bad_entry >= 0.60
+                else "neutral"
+            ),
+        }
+
+    @staticmethod
     def _recency_alpha(duration_sec: float, dry_run: bool) -> float:
         dur = max(0.0, _safe_float(duration_sec, 0.0))
         base = 0.14 if dry_run else 0.11
@@ -4566,31 +5261,39 @@ class Bot:
             rk = "flat"
         st = self.regime_trade_feedback.get(rk, {})
         alpha = self._recency_alpha(duration_sec, bool(self.config.DRY_RUN))
-        exit_reason_norm = str(exit_reason or "").strip().lower()
-        win_now = 1.0 if pnl_pct_net > 0 else 0.0
-        # Reward clean TP/trailing exits more than defensive exits.
-        exit_eff_now = 0.50
-        if exit_reason_norm in {"take_profit", "trailing_stop"}:
-            exit_eff_now = 1.0
-        elif exit_reason_norm in {"smart_stagnation_exit", "stall_exit"}:
-            exit_eff_now = 0.65 if pnl_pct_net >= 0 else 0.35
-        elif exit_reason_norm in {"stop_loss", "time_stop", "ai_quality_fade"}:
-            exit_eff_now = 0.15 if pnl_pct_net < 0 else 0.45
+        outcome = self._trade_learning_outcome(
+            pnl_pct_net=pnl_pct_net,
+            entry_quality=entry_quality,
+            entry_edge=entry_edge,
+            exit_reason=exit_reason,
+            duration_sec=duration_sec,
+        )
+        win_now = _safe_float(outcome.get("win"), 0.0)
+        exit_eff_now = _safe_float(outcome.get("exit_efficiency"), 0.5)
+        good_entry_now = _safe_float(outcome.get("good_entry"), 0.5)
+        bad_entry_now = _safe_float(outcome.get("bad_entry"), 0.0)
+        tp_unreachable_now = _safe_float(outcome.get("tp_unreachable"), 0.0)
         ema_pnl = ((1.0 - alpha) * _safe_float(st.get("ema_pnl"), 0.0)) + (alpha * pnl_pct_net)
         ema_win = ((1.0 - alpha) * _safe_float(st.get("ema_win"), 0.5)) + (alpha * win_now)
         ema_quality = ((1.0 - alpha) * _safe_float(st.get("ema_quality"), 0.5)) + (alpha * _clamp(entry_quality, 0.0, 1.0))
         ema_edge = ((1.0 - alpha) * _safe_float(st.get("ema_edge"), 0.0)) + (alpha * entry_edge)
         ema_exit_eff = ((1.0 - alpha) * _safe_float(st.get("ema_exit_efficiency"), 0.5)) + (alpha * exit_eff_now)
+        ema_good_entry = ((1.0 - alpha) * _safe_float(st.get("ema_good_entry"), 0.5)) + (alpha * good_entry_now)
+        ema_bad_entry = ((1.0 - alpha) * _safe_float(st.get("ema_bad_entry"), 0.0)) + (alpha * bad_entry_now)
+        ema_tp_unreachable = ((1.0 - alpha) * _safe_float(st.get("ema_tp_unreachable"), 0.0)) + (alpha * tp_unreachable_now)
         self.regime_trade_feedback[rk] = {
             "ema_pnl": float(ema_pnl),
             "ema_win": float(ema_win),
             "ema_quality": float(ema_quality),
             "ema_edge": float(ema_edge),
             "ema_exit_efficiency": float(ema_exit_eff),
+            "ema_good_entry": float(ema_good_entry),
+            "ema_bad_entry": float(ema_bad_entry),
+            "ema_tp_unreachable": float(ema_tp_unreachable),
             "count": float(_safe_float(st.get("count"), 0.0) + 1.0),
             "updated_ts": float(time.time()),
         }
-        score_now = _clamp((win_now * 0.55) + (max(-0.03, min(0.03, pnl_pct_net)) * 8.0) + (exit_eff_now * 0.20), 0.0, 1.0)
+        score_now = _safe_float(outcome.get("score"), 0.5)
         self.recent_trade_scores.append(float(score_now))
         self._update_shared_learning_feedback(
             ai_quality=entry_quality,
@@ -4600,12 +5303,19 @@ class Bot:
             decision_score=score_now,
             trade_score=score_now,
         )
+        self._update_confidence_calibration(
+            ai_conf=_clamp(entry_quality + 0.06, 0.0, 1.0),
+            realized_score=score_now,
+        )
         sym_key = f"{str(symbol or '').upper().strip()}|{rk}"
         if sym_key and "|" in sym_key:
             sym_state = self.symbol_regime_trade_feedback.get(sym_key, {})
             self.symbol_regime_trade_feedback[sym_key] = {
                 "ema_pnl": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_pnl"), 0.0)) + (alpha * pnl_pct_net)),
                 "ema_win": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_win"), 0.5)) + (alpha * win_now)),
+                "ema_good_entry": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_good_entry"), 0.5)) + (alpha * good_entry_now)),
+                "ema_bad_entry": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_bad_entry"), 0.0)) + (alpha * bad_entry_now)),
+                "ema_tp_unreachable": float(((1.0 - alpha) * _safe_float(sym_state.get("ema_tp_unreachable"), 0.0)) + (alpha * tp_unreachable_now)),
                 "count": float(_safe_float(sym_state.get("count"), 0.0) + 1.0),
                 "updated_ts": float(time.time()),
             }
@@ -4618,6 +5328,9 @@ class Bot:
         ema_pnl = _safe_float(st.get("ema_pnl"), 0.0)
         ema_win = _safe_float(st.get("ema_win"), 0.5)
         ema_exit_eff = _safe_float(st.get("ema_exit_efficiency"), 0.5)
+        ema_good_entry = _safe_float(st.get("ema_good_entry"), 0.5)
+        ema_bad_entry = _safe_float(st.get("ema_bad_entry"), 0.0)
+        ema_tp_unreachable = _safe_float(st.get("ema_tp_unreachable"), 0.0)
         confidence = _clamp(count / (18.0 if self.config.DRY_RUN else 12.0), 0.0, 1.0)
         edge_mult = 1.0
         time_mult = 1.0
@@ -4630,6 +5343,16 @@ class Bot:
             edge_mult -= (0.05 * confidence)
             time_mult += (0.08 * confidence)
             exit_bias -= (0.05 * confidence)
+        if ema_bad_entry >= 0.56:
+            edge_mult += (0.06 * confidence)
+            exit_bias += (0.08 * confidence)
+        if ema_tp_unreachable >= 0.42:
+            edge_mult += (0.05 * confidence)
+            time_mult -= (0.08 * confidence)
+            exit_bias += (0.06 * confidence)
+        if ema_good_entry >= 0.62 and ema_exit_eff >= 0.56:
+            edge_mult -= (0.03 * confidence)
+            exit_bias -= (0.03 * confidence)
         return {
             "edge_mult": float(_clamp(edge_mult, 0.88, 1.18)),
             "time_mult": float(_clamp(time_mult, 0.82, 1.20)),
@@ -4651,6 +5374,9 @@ class Bot:
         ema_pnl = _safe_float(st.get("ema_pnl"), 0.0)
         ema_win = _safe_float(st.get("ema_win"), 0.5)
         ema_decision = _safe_float(st.get("ema_decision"), 0.5)
+        ema_good_entry = _safe_float(st.get("ema_good_entry"), 0.5)
+        ema_bad_entry = _safe_float(st.get("ema_bad_entry"), 0.0)
+        ema_tp_unreachable = _safe_float(st.get("ema_tp_unreachable"), 0.0)
         confidence = _clamp(count / (10.0 if self.config.DRY_RUN else 7.0), 0.0, 1.0)
         edge_delta = 0.0
         quality_delta = 0.0
@@ -4666,6 +5392,15 @@ class Bot:
         elif ema_decision > 0.64:
             edge_delta -= 0.00018 * max(0.35, confidence)
             quality_delta -= 0.007 * max(0.35, confidence)
+        if ema_bad_entry >= 0.58:
+            edge_delta += 0.00028 * max(0.35, confidence)
+            quality_delta += 0.009 * max(0.35, confidence)
+        if ema_tp_unreachable >= 0.44:
+            edge_delta += 0.00022 * max(0.35, confidence)
+            quality_delta += 0.006 * max(0.35, confidence)
+        if ema_good_entry >= 0.62 and ema_win >= 0.55:
+            edge_delta -= 0.00016 * max(0.35, confidence)
+            quality_delta -= 0.005 * max(0.35, confidence)
         if recent_items:
             recent_scores = [float(_safe_float(x.get("decision_score"), 0.5)) for x in recent_items]
             recent_avg = float(sum(recent_scores) / max(1, len(recent_scores)))
@@ -4828,6 +5563,304 @@ class Bot:
             "exec_quality": float(exec_quality),
         }
 
+    def _market_regime_bucket(
+        self,
+        regime: str,
+        flags: set[str] | list[str] | tuple[str, ...] | None = None,
+        market_volatility: float = 0.0,
+        anomaly_score: float = 0.0,
+        momentum_speed: float = 0.0,
+    ) -> str:
+        regime_name = str(regime or "flat").strip().lower() or "flat"
+        raw_flags = flags if isinstance(flags, (set, list, tuple)) else []
+        flag_set = {str(x or "").strip().lower() for x in raw_flags if str(x or "").strip()}
+        vol = max(0.0, _safe_float(market_volatility, 0.0))
+        anomaly = max(0.0, _safe_float(anomaly_score, 0.0))
+        momentum = max(0.0, _safe_float(momentum_speed, 0.0))
+        if anomaly >= 0.72 or "dangerous" in flag_set:
+            return "danger_anomalous"
+        if regime_name == "impulse" or ("volume_spike" in flag_set and momentum >= 0.30):
+            return "trend_impulse" if regime_name in {"trend", "impulse"} else "flat_spike"
+        if regime_name == "trend":
+            if momentum >= 0.22 or vol >= 0.0026:
+                return "trend_fast"
+            if "low_vol" in flag_set or "low_volatility" in flag_set:
+                return "trend_low_vol"
+            return "trend_slow"
+        if regime_name in {"range", "flat"}:
+            if "low_vol" in flag_set or "low_volatility" in flag_set or vol <= 0.0010:
+                return "flat_low_vol"
+            if "chop" in flag_set or "sideways" in flag_set or momentum <= 0.10:
+                return "flat_chop"
+            return "flat_balanced"
+        if "low_vol" in flag_set or "low_volatility" in flag_set:
+            return "neutral_low_vol"
+        return f"{regime_name}_base"
+
+    @staticmethod
+    def _confidence_bucket(confidence: float) -> str:
+        conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
+        if conf >= 0.82:
+            return "very_high"
+        if conf >= 0.68:
+            return "high"
+        if conf >= 0.56:
+            return "mid"
+        if conf >= 0.44:
+            return "soft"
+        return "low"
+
+    def _update_confidence_calibration(
+        self,
+        *,
+        ai_conf: float,
+        realized_score: float,
+    ) -> None:
+        conf = _clamp(_safe_float(ai_conf, 0.0), 0.0, 1.0)
+        score = _clamp(_safe_float(realized_score, 0.5), 0.0, 1.0)
+        bucket = self._confidence_bucket(conf)
+        alpha = 0.10 if score >= 0.60 or score <= 0.40 else 0.06
+        st = dict(self.confidence_calibration_state or {})
+        st["overall_ema_score"] = ((1.0 - alpha) * _safe_float(st.get("overall_ema_score"), 0.50)) + (alpha * score)
+        st["overall_ema_margin"] = ((1.0 - alpha) * _safe_float(st.get("overall_ema_margin"), 0.0)) + (alpha * (score - conf))
+        raw_bucket_stats = st.get("bucket_stats", {})
+        bucket_stats = dict(raw_bucket_stats) if isinstance(raw_bucket_stats, dict) else {}
+        bucket_state = dict(bucket_stats.get(bucket, {}))
+        bucket_state["ema_score"] = ((1.0 - alpha) * _safe_float(bucket_state.get("ema_score"), 0.50)) + (alpha * score)
+        bucket_state["ema_margin"] = ((1.0 - alpha) * _safe_float(bucket_state.get("ema_margin"), 0.0)) + (alpha * (score - conf))
+        bucket_state["count"] = min(5000.0, _safe_float(bucket_state.get("count"), 0.0) + 1.0)
+        bucket_state["updated_ts"] = float(time.time())
+        bucket_stats[bucket] = bucket_state
+        st["bucket_stats"] = bucket_stats
+        st["updated_ts"] = float(time.time())
+        self.confidence_calibration_state = st
+
+    def _confidence_calibration_bias(self, ai_conf: float) -> Dict[str, float]:
+        conf = _clamp(_safe_float(ai_conf, 0.0), 0.0, 1.0)
+        st = dict(self.confidence_calibration_state or {})
+        bucket = self._confidence_bucket(conf)
+        bucket_stats = st.get("bucket_stats", {})
+        bucket_state = dict(bucket_stats.get(bucket, {})) if isinstance(bucket_stats, dict) else {}
+        bucket_margin = _safe_float(bucket_state.get("ema_margin"), 0.0)
+        bucket_score = _clamp(_safe_float(bucket_state.get("ema_score"), _safe_float(st.get("overall_ema_score"), 0.50)), 0.0, 1.0)
+        bucket_count = _safe_float(bucket_state.get("count"), 0.0)
+        strength = _clamp(bucket_count / 36.0, 0.0, 1.0)
+        edge_delta = 0.0
+        quality_delta = 0.0
+        conf_delta = 0.0
+        if bucket_margin <= -0.06 and conf >= 0.56:
+            edge_delta += 0.00022 * max(0.35, strength)
+            quality_delta += 0.007 * max(0.35, strength)
+            conf_delta += 0.010 * max(0.35, strength)
+        elif bucket_margin >= 0.05 and bucket_score >= 0.58:
+            edge_delta -= 0.00014 * max(0.30, strength)
+            quality_delta -= 0.005 * max(0.30, strength)
+            conf_delta -= 0.008 * max(0.30, strength)
+        return {
+            "edge_delta": float(_clamp(edge_delta, -0.00022, 0.00036)),
+            "quality_delta": float(_clamp(quality_delta, -0.008, 0.012)),
+            "conf_delta": float(_clamp(conf_delta, -0.012, 0.016)),
+            "bucket": bucket,
+            "score": float(bucket_score),
+            "margin": float(bucket_margin),
+        }
+
+    def _missed_opportunity_keys(self, symbol: str, regime_bucket: str) -> list[str]:
+        sym = str(symbol or "").upper().strip()
+        bucket = str(regime_bucket or "flat_balanced").strip().upper()
+        keys: list[str] = []
+        if sym and bucket:
+            keys.append(f"{sym}|{bucket}")
+        if bucket:
+            keys.append(bucket)
+        return keys
+
+    def _register_missed_opportunity_candidate(
+        self,
+        *,
+        symbol: str,
+        regime_bucket: str,
+        event: str,
+        ai_action: str,
+        ai_conf: float,
+        ai_quality: float,
+        expected_edge_pct: float,
+        min_expected_edge_pct: float,
+        price: float,
+        latest_candle_ts: int,
+        buy_block_reasons: list[str],
+    ) -> None:
+        evt = str(event or "").strip().lower()
+        action = str(ai_action or "").strip().upper()
+        sym = str(symbol or "").upper().strip()
+        px = max(0.0, _safe_float(price, 0.0))
+        if evt not in {"entry_blocked", "no_trade_signal", "training_no_signal", "risk_guard_blocked"}:
+            return
+        if not sym or px <= 0 or action not in {"LONG", "SHORT"}:
+            return
+        conf = _clamp(_safe_float(ai_conf, 0.0), 0.0, 1.0)
+        quality = _clamp(_safe_float(ai_quality, 0.0), 0.0, 1.0)
+        edge_now = _safe_float(expected_edge_pct, 0.0)
+        edge_floor = max(1e-9, _safe_float(min_expected_edge_pct, 0.0))
+        if conf < 0.54 or quality < 0.50:
+            return
+        if edge_now < (edge_floor * 0.60):
+            return
+        reasons = [str(x or "").strip().lower() for x in buy_block_reasons if str(x or "").strip()]
+        if reasons and all("market_data" in x for x in reasons):
+            return
+        self.pending_opportunity_setups.append({
+            "symbol": sym,
+            "bucket": str(regime_bucket or "flat_balanced").strip().upper(),
+            "action": action,
+            "entry_price": float(px),
+            "entry_edge": float(edge_now),
+            "entry_floor": float(edge_floor),
+            "entry_conf": float(conf),
+            "entry_quality": float(quality),
+            "entry_candle_ts": int(latest_candle_ts),
+            "created_ts": float(time.time()),
+            "expiry_sec": float(780.0 if (self.config.DRY_RUN and self.config.AI_TRAINING_MODE) else 1020.0),
+            "reasons": reasons[:5],
+        })
+
+    def _refresh_missed_opportunities(self, symbol: str, current_price: float, latest_candle_ts: int) -> None:
+        if not self.pending_opportunity_setups:
+            return
+        sym = str(symbol or "").upper().strip()
+        px = max(0.0, _safe_float(current_price, 0.0))
+        if not sym or px <= 0:
+            return
+        now_ts = time.time()
+        remaining: deque[Dict[str, object]] = deque(maxlen=self.pending_opportunity_setups.maxlen)
+        while self.pending_opportunity_setups:
+            item = self.pending_opportunity_setups.popleft()
+            if not isinstance(item, dict):
+                continue
+            item_sym = str(item.get("symbol", "")).upper().strip()
+            if item_sym != sym:
+                if (now_ts - _safe_float(item.get("created_ts"), now_ts)) < _safe_float(item.get("expiry_sec"), 900.0):
+                    remaining.append(item)
+                continue
+            age_sec = max(0.0, now_ts - _safe_float(item.get("created_ts"), now_ts))
+            candles_elapsed = self._candles_since(int(latest_candle_ts), int(_safe_float(item.get("entry_candle_ts"), 0.0)), self.config.TIMEFRAME)
+            if age_sec < _safe_float(item.get("expiry_sec"), 900.0) and candles_elapsed < 6:
+                remaining.append(item)
+                continue
+            entry_price = max(1e-9, _safe_float(item.get("entry_price"), 0.0))
+            move_pct = (px / entry_price) - 1.0
+            if str(item.get("action", "")).upper() == "SHORT":
+                move_pct *= -1.0
+            threshold = max(0.0012, min(0.0080, max(
+                _safe_float(item.get("entry_edge"), 0.0) * 0.70,
+                _safe_float(item.get("entry_floor"), 0.0) * 0.85,
+            )))
+            good = 1.0 if move_pct >= threshold else 0.0
+            bad = 1.0 if move_pct <= (-threshold * 0.60) else 0.0
+            alpha = 0.14 if (self.config.DRY_RUN and self.config.AI_TRAINING_MODE) else 0.11
+            for key in self._missed_opportunity_keys(sym, str(item.get("bucket", ""))):
+                st = dict(self.missed_opportunity_feedback.get(key, {}))
+                st["ema_good"] = ((1.0 - alpha) * _safe_float(st.get("ema_good"), 0.5)) + (alpha * good)
+                st["ema_bad"] = ((1.0 - alpha) * _safe_float(st.get("ema_bad"), 0.5)) + (alpha * bad)
+                st["ema_move"] = ((1.0 - alpha) * _safe_float(st.get("ema_move"), 0.0)) + (alpha * move_pct)
+                st["count"] = min(5000.0, _safe_float(st.get("count"), 0.0) + 1.0)
+                st["updated_ts"] = float(now_ts)
+                self.missed_opportunity_feedback[key] = st
+            self._update_skip_learning_feedback(
+                good_skip=good,
+                bad_skip=bad,
+                move_pct=move_pct,
+            )
+        self.pending_opportunity_setups = remaining
+
+    def _missed_opportunity_bias(self, symbol: str, regime_bucket: str) -> Dict[str, float]:
+        ema_good = 0.5
+        ema_bad = 0.5
+        ema_move = 0.0
+        count = 0.0
+        for key in self._missed_opportunity_keys(symbol, regime_bucket):
+            st = dict(self.missed_opportunity_feedback.get(key, {}))
+            if not st:
+                continue
+            weight = 1.0 if "|" in key else 0.55
+            ema_good += (_safe_float(st.get("ema_good"), 0.5) - 0.5) * weight
+            ema_bad += (_safe_float(st.get("ema_bad"), 0.5) - 0.5) * weight
+            ema_move += _safe_float(st.get("ema_move"), 0.0) * weight
+            count += _safe_float(st.get("count"), 0.0) * weight
+        strength = _clamp(count / 28.0, 0.0, 1.0)
+        edge_delta = 0.0
+        quality_delta = 0.0
+        risk_mult = 1.0
+        if ema_good >= 0.58 and ema_bad <= 0.46 and ema_move >= 0.0008:
+            edge_delta -= 0.00016 * max(0.35, strength)
+            quality_delta -= 0.005 * max(0.35, strength)
+            risk_mult *= 1.02
+        elif ema_bad >= 0.58 and ema_good <= 0.46:
+            edge_delta += 0.00022 * max(0.35, strength)
+            quality_delta += 0.007 * max(0.35, strength)
+            risk_mult *= 0.94
+        return {
+            "edge_delta": float(_clamp(edge_delta, -0.00022, 0.00032)),
+            "quality_delta": float(_clamp(quality_delta, -0.008, 0.010)),
+            "risk_mult": float(_clamp(risk_mult, 0.90, 1.03)),
+            "score": float(_clamp((ema_good - ema_bad) + (ema_move * 22.0), -1.0, 1.0)),
+            "count": float(count),
+        }
+
+    def _anti_fragile_mode(self, symbol: str, regime_bucket: str) -> Dict[str, float]:
+        exec_stress = self._execution_stress_mode()
+        missed_bias = self._missed_opportunity_bias(symbol, regime_bucket)
+        symbol_exec = self._symbol_execution_bias(symbol)
+        shared_bias = self._shared_learning_bias()
+        stress_score = _safe_float(exec_stress.get("score"), 0.0)
+        missed_score = _safe_float(missed_bias.get("score"), 0.0)
+        exec_quality = _safe_float(symbol_exec.get("exec_quality"), 0.5)
+        mode_score = 0.0
+        if stress_score >= 0.24:
+            mode_score += stress_score * 0.55
+        if exec_quality <= 0.38:
+            mode_score += 0.20
+        if missed_score <= -0.10:
+            mode_score += min(0.18, abs(missed_score) * 0.18)
+        if _safe_float(shared_bias.get("score"), 0.5) <= 0.42:
+            mode_score += 0.12
+        mode_score = _clamp(mode_score, 0.0, 1.0)
+        if mode_score < 0.20:
+            if missed_score >= 0.12 and exec_quality >= 0.58 and stress_score < 0.12:
+                return {
+                    "edge_delta": -0.00010,
+                    "quality_delta": -0.004,
+                    "conf_delta": -0.003,
+                    "risk_mult": 1.02,
+                    "tp_mult": 1.02,
+                    "ts_mult": 1.01,
+                    "sl_mult": 1.00,
+                    "label": "resilient",
+                    "score": 0.12,
+                }
+            return {
+                "edge_delta": 0.0,
+                "quality_delta": 0.0,
+                "conf_delta": 0.0,
+                "risk_mult": 1.0,
+                "tp_mult": 1.0,
+                "ts_mult": 1.0,
+                "sl_mult": 1.0,
+                "label": "neutral",
+                "score": float(mode_score),
+            }
+        return {
+            "edge_delta": float(_clamp(mode_score * 0.0008, 0.0, 0.0010)),
+            "quality_delta": float(_clamp(mode_score * 0.015, 0.0, 0.018)),
+            "conf_delta": float(_clamp(mode_score * 0.012, 0.0, 0.015)),
+            "risk_mult": float(_clamp(1.0 - (mode_score * 0.20), 0.78, 1.0)),
+            "tp_mult": float(_clamp(1.0 - (mode_score * 0.14), 0.86, 1.0)),
+            "ts_mult": float(_clamp(1.0 - (mode_score * 0.10), 0.88, 1.0)),
+            "sl_mult": float(_clamp(1.0 - (mode_score * 0.05), 0.94, 1.0)),
+            "label": "anti_fragile_guard",
+            "score": float(mode_score),
+        }
+
     def _update_shared_learning_feedback(
         self,
         *,
@@ -4857,6 +5890,21 @@ class Bot:
         st["updated_ts"] = float(time.time())
         self.shared_learning_feedback = st
 
+    def _update_skip_learning_feedback(
+        self,
+        *,
+        good_skip: float,
+        bad_skip: float,
+        move_pct: float,
+    ) -> None:
+        st = dict(self.shared_learning_feedback or {})
+        alpha = 0.050 if (self.config.DRY_RUN and self.config.AI_TRAINING_MODE) else 0.040
+        st["ema_good_skip"] = ((1.0 - alpha) * _safe_float(st.get("ema_good_skip"), 0.50)) + (alpha * _clamp(good_skip, 0.0, 1.0))
+        st["ema_bad_skip"] = ((1.0 - alpha) * _safe_float(st.get("ema_bad_skip"), 0.50)) + (alpha * _clamp(bad_skip, 0.0, 1.0))
+        st["ema_skip_move"] = ((1.0 - alpha) * _safe_float(st.get("ema_skip_move"), 0.0)) + (alpha * float(move_pct))
+        st["updated_ts"] = float(time.time())
+        self.shared_learning_feedback = st
+
     def _shared_learning_bias(self) -> Dict[str, float]:
         st = dict(self.shared_learning_feedback or {})
         ema_pass = _clamp(_safe_float(st.get("ema_pass"), 0.25), 0.0, 1.0)
@@ -4865,9 +5913,13 @@ class Bot:
         ema_edge_margin = _safe_float(st.get("ema_edge_margin"), 0.0)
         ema_trade_score = _clamp(_safe_float(st.get("ema_trade_score"), 0.50), 0.0, 1.0)
         ema_cycle_score = _clamp(_safe_float(st.get("ema_cycle_score"), 0.50), 0.0, 1.0)
+        ema_good_skip = _clamp(_safe_float(st.get("ema_good_skip"), 0.50), 0.0, 1.0)
+        ema_bad_skip = _clamp(_safe_float(st.get("ema_bad_skip"), 0.50), 0.0, 1.0)
+        ema_skip_move = _safe_float(st.get("ema_skip_move"), 0.0)
         training_weight = _safe_float(st.get("training_weight"), 0.0)
         live_weight = _safe_float(st.get("live_weight"), 0.0)
-        combined_score = (ema_trade_score * 0.56) + (ema_cycle_score * 0.44)
+        skip_balance = _clamp((ema_good_skip - ema_bad_skip) + (ema_skip_move * 18.0), -1.0, 1.0)
+        combined_score = (ema_trade_score * 0.50) + (ema_cycle_score * 0.34) + ((_clamp(skip_balance, -1.0, 1.0) + 1.0) * 0.08)
         live_dominant = live_weight >= max(8.0, training_weight * 0.20)
         edge_delta = 0.0
         quality_delta = 0.0
@@ -4885,6 +5937,12 @@ class Bot:
         elif ema_quality >= 0.64 and ema_conf >= 0.64:
             quality_delta -= 0.004
             conf_delta -= 0.004
+        if skip_balance <= -0.18:
+            edge_delta += 0.00016
+            quality_delta += 0.005
+        elif skip_balance >= 0.16 and ema_trade_score >= 0.52:
+            edge_delta -= 0.00014
+            quality_delta -= 0.004
         if not live_dominant:
             edge_delta *= 0.82
             quality_delta *= 0.82
@@ -4894,6 +5952,7 @@ class Bot:
             "quality_delta": float(_clamp(quality_delta, -0.012, 0.016)),
             "conf_delta": float(_clamp(conf_delta, -0.012, 0.016)),
             "score": float(_clamp(combined_score, 0.0, 1.0)),
+            "skip_balance": float(skip_balance),
             "label": ("live_weighted" if live_dominant else "training_seeded"),
         }
 
@@ -5049,6 +6108,7 @@ class Bot:
         *,
         symbol: str,
         regime: str,
+        regime_bucket: str = "",
         event: str,
         buy_block_reasons: list[str],
         ai_quality: float,
@@ -5069,6 +6129,7 @@ class Bot:
         item = {
             "symbol": str(symbol or "").upper().strip(),
             "regime": str(regime or "flat").strip().lower(),
+            "regime_bucket": str(regime_bucket or "").strip().lower(),
             "event": str(event or "").strip().lower(),
             "buy_block_reasons": [str(x or "").strip().lower() for x in buy_block_reasons if str(x or "").strip()],
             "ai_quality": float(_clamp(ai_quality, 0.0, 1.0)),
@@ -5087,6 +6148,10 @@ class Bot:
             expected_edge_pct=expected_edge_pct,
             min_expected_edge_pct=min_expected_edge_pct,
             decision_score=decision_score,
+        )
+        self._update_confidence_calibration(
+            ai_conf=ai_conf,
+            realized_score=decision_score,
         )
         sym_key = f"{str(symbol or '').upper().strip()}|{str(regime or 'flat').strip().lower()}"
         if sym_key and "|" in sym_key:
@@ -5256,6 +6321,7 @@ class Bot:
         *,
         symbol: str,
         has_open_position: bool,
+        current_price: float,
         cycle_equity_usdt: float,
         active_risk: dict,
         market_ctx: dict[str, object],
@@ -5289,6 +6355,13 @@ class Bot:
         regime = str(market_ctx.get("regime", "flat") or "flat").lower().strip()
         flags_raw = market_ctx.get("flags", [])
         flags = {str(x).lower().strip() for x in flags_raw} if isinstance(flags_raw, list) else set()
+        regime_bucket = self._market_regime_bucket(
+            regime,
+            flags,
+            market_volatility=_safe_float(market_ctx.get("market_volatility"), 0.0),
+            anomaly_score=anomaly_score,
+            momentum_speed=momentum_speed,
+        )
         ai_quality = self._quality_for_entry(ai_signal)
         soft_q = self._param_f("AI_ENTRY_SOFT_QUALITY", self.config.AI_ENTRY_SOFT_QUALITY)
 
@@ -5313,7 +6386,7 @@ class Bot:
             weak_score -= 0.30
         weak_score = _clamp(weak_score, 0.0, 1.0)
         if weak_score < 0.45:
-            return risk, out
+            weak_score = max(weak_score, 0.0)
 
         # Stronger weakness -> stronger TP squeeze and tighter trailing.
         tp_mult = _lerp(0.90, 0.42, weak_score)
@@ -5337,6 +6410,31 @@ class Bot:
         if tiny_balance_score > 0 and weak_score >= 0.35:
             tp_mult *= _lerp(0.92, 0.72, tiny_balance_score)
             reasons.append("tiny_balance")
+
+        mem = dict(self.position_memory.get(str(symbol or "").upper().strip(), {}))
+        entry_px = max(0.0, _safe_float(mem.get("entry_price"), 0.0))
+        peak_px = max(0.0, _safe_float(mem.get("peak_price"), entry_px))
+        candles_in_position = int(_safe_float(mem.get("candles_in_position"), 0.0))
+        candles_since_peak = int(_safe_float(mem.get("candles_since_peak"), 0.0))
+        current_px = max(0.0, _safe_float(current_price, 0.0))
+        if entry_px > 0 and current_px > 0 and tp_old > 0:
+            tp_target_price = entry_px * (1.0 + tp_old)
+            denom = max(1e-9, tp_target_price - entry_px)
+            tp_progress = _clamp((current_px - entry_px) / denom, -1.0, 2.0)
+            stall_ratio = (candles_since_peak / float(max(1, candles_in_position))) if candles_in_position > 0 else 0.0
+            anti_fragile = self._anti_fragile_mode(symbol, regime_bucket)
+            if candles_in_position >= 4 and tp_progress < 0.34 and stall_ratio >= 0.42:
+                weak_score = _clamp(weak_score + 0.16, 0.0, 1.0)
+                tp_mult *= _clamp(_safe_float(anti_fragile.get("tp_mult"), 1.0), 0.86, 1.0)
+                ts_mult *= _clamp(_safe_float(anti_fragile.get("ts_mult"), 1.0), 0.88, 1.0)
+                reasons.append("tp_probability_drop")
+            elif tp_progress >= 0.68 and momentum_speed >= 0.22 and regime_bucket in {"trend_fast", "trend_impulse"}:
+                tp_mult *= 1.03
+                ts_mult *= 1.01
+                reasons.append("tp_probability_hold")
+
+        if weak_score < 0.45 and not any(x in {"tp_probability_drop", "tp_probability_hold"} for x in reasons):
+            return risk, out
 
         fee_and_slippage = 2.0 * (max(0.0, self.config.AI_FEE_BPS) + max(0.0, self.config.AI_SLIPPAGE_BPS)) / 10_000.0
         tp_floor = max(self.config.AI_TAKE_PROFIT_MIN, fee_and_slippage + 0.0015)
@@ -5372,9 +6470,135 @@ class Bot:
             "ts_to": float(ts_new),
             "reason": ",".join(reasons) if reasons else "weak_market",
             "symbol": symbol,
+            "regime_bucket": regime_bucket,
             "tiny_balance_score": round(float(tiny_balance_score), 4),
             "cycle_equity_usdt": float(eq),
             "symbol_exec_bias": dict(symbol_exec_bias),
+        }
+        return risk, out
+
+    def _apply_entry_tp_reachability_cap(
+        self,
+        *,
+        symbol: str,
+        has_open_position: bool,
+        active_risk: dict,
+        market_ctx: dict[str, object],
+        ai_signal: Optional[AISignal],
+        atr_pct: float,
+        cycle_equity_usdt: float,
+    ) -> tuple[dict[str, float], dict[str, object]]:
+        """
+        Entry-side TP realism cap.
+        Prevents optimistic TP targets in weak/flat markets where the signal can be strong
+        but realized move is usually too short to reach a distant target.
+        """
+        out = {
+            "applied": False,
+            "profile": "none",
+            "tp_from": 0.0,
+            "tp_to": 0.0,
+            "cap_rr": 0.0,
+            "cap_atr": 0.0,
+            "cap_hard": 0.0,
+            "reason": "",
+            "symbol": symbol,
+        }
+        risk = dict(active_risk)
+        if has_open_position:
+            return risk, out
+
+        tp_old = max(0.0, _safe_float(risk.get("take_profit"), 0.0))
+        sl_now = max(0.0, _safe_float(risk.get("stop_loss"), 0.0))
+        if tp_old <= 0.0 or sl_now <= 0.0:
+            return risk, out
+
+        regime = str(market_ctx.get("regime", "flat") or "flat").lower().strip()
+        flags_raw = market_ctx.get("flags", [])
+        flags = {str(x).lower().strip() for x in flags_raw} if isinstance(flags_raw, list) else set()
+        market_volatility = max(0.0, _safe_float(market_ctx.get("market_volatility"), 0.0))
+        momentum_speed = max(0.0, _safe_float(market_ctx.get("momentum_speed"), 0.0))
+        impulse_score = max(0.0, _safe_float(market_ctx.get("impulse_score"), 0.0))
+        anomaly_score = max(0.0, _safe_float(market_ctx.get("anomaly_score"), 0.0))
+
+        ai_quality = self._quality_for_entry(ai_signal)
+        conf_base = 0.5
+        if ai_signal is not None:
+            conf_base = ai_signal.calibrated_confidence if ai_signal.calibrated_confidence > 0 else ai_signal.confidence
+        ai_conf = _clamp(conf_base, 0.0, 1.0)
+        signal_strength = _clamp((ai_quality * 0.56) + (ai_conf * 0.44), 0.0, 1.0)
+
+        weak_market = (
+            regime in {"flat", "range"}
+            or ("low_vol" in flags)
+            or ("low_volatility" in flags)
+        )
+        strong_impulse = (
+            regime in {"trend", "impulse"}
+            and impulse_score >= 1.6
+            and momentum_speed >= 0.18
+            and ("low_vol" not in flags)
+            and ("low_volatility" not in flags)
+        )
+        tiny_balance_score = 0.0
+        eq = max(0.0, _safe_float(cycle_equity_usdt, 0.0))
+        if eq > 0:
+            if eq <= 3.5:
+                tiny_balance_score = 1.0
+            elif eq <= 7.0:
+                tiny_balance_score = 0.70
+            elif eq <= 15.0:
+                tiny_balance_score = 0.35
+
+        fee_and_slippage = 2.0 * (max(0.0, self.config.AI_FEE_BPS) + max(0.0, self.config.AI_SLIPPAGE_BPS)) / 10_000.0
+        tp_floor = max(self.config.AI_TAKE_PROFIT_MIN, fee_and_slippage + 0.0013)
+
+        if weak_market and not strong_impulse:
+            rr_cap_mult = _lerp(1.04, 1.26, signal_strength)
+            atr_cap_mult = _lerp(0.72, 1.12, signal_strength)
+            hard_cap = _lerp(0.0052, 0.0092, signal_strength)
+            if momentum_speed < 0.12:
+                hard_cap *= 0.92
+            if anomaly_score >= 0.55:
+                hard_cap *= 0.94
+        else:
+            rr_cap_mult = _lerp(1.18, 1.85, signal_strength)
+            atr_cap_mult = _lerp(1.05, 1.70, signal_strength)
+            hard_cap = _lerp(0.0085, 0.0180, signal_strength)
+            if strong_impulse:
+                hard_cap *= 1.08
+
+        if tiny_balance_score > 0:
+            shrink = _lerp(0.95, 0.78, tiny_balance_score)
+            rr_cap_mult *= shrink
+            atr_cap_mult *= shrink
+            hard_cap *= shrink
+
+        if market_volatility > 0 and weak_market and not strong_impulse:
+            hard_cap = min(hard_cap, max(tp_floor, market_volatility * 10.0))
+
+        cap_rr = max(tp_floor, sl_now * rr_cap_mult)
+        cap_atr = max(tp_floor, atr_pct * atr_cap_mult) if atr_pct > 0 else tp_old
+        cap_hard = max(tp_floor, min(self.config.AI_TAKE_PROFIT_MAX, hard_cap))
+        tp_cap = max(tp_floor, min(tp_old, cap_rr, cap_atr, cap_hard))
+
+        if tp_cap >= (tp_old - 1e-9):
+            return risk, out
+
+        risk["take_profit"] = max(tp_floor, tp_cap)
+        out = {
+            "applied": True,
+            "profile": "entry_reachability_cap",
+            "tp_from": float(tp_old),
+            "tp_to": float(risk["take_profit"]),
+            "cap_rr": float(cap_rr),
+            "cap_atr": float(cap_atr),
+            "cap_hard": float(cap_hard),
+            "reason": "weak_market" if weak_market and not strong_impulse else "market_reachability",
+            "symbol": symbol,
+            "signal_strength": float(signal_strength),
+            "tiny_balance_score": float(tiny_balance_score),
+            "strong_impulse": bool(strong_impulse),
         }
         return risk, out
 
@@ -5602,6 +6826,19 @@ class Bot:
                 self.config.AI_TAKE_PROFIT_MIN,
                 risk_profile["take_profit"] * 0.96,
             )
+            risk_profile["trailing_stop"] = max(
+                self.config.AI_TRAILING_STOP_MIN,
+                risk_profile["trailing_stop"] * 0.97,
+            )
+            if self.loss_streak_live >= 2:
+                risk_profile["take_profit"] = max(
+                    self.config.AI_TAKE_PROFIT_MIN,
+                    risk_profile["take_profit"] * 0.90,
+                )
+                risk_profile["trailing_stop"] = max(
+                    self.config.AI_TRAILING_STOP_MIN,
+                    risk_profile["trailing_stop"] * 0.93,
+                )
         risk_profile["stop_loss"] = _clamp(
             risk_profile["stop_loss"],
             self.config.AI_STOP_LOSS_MIN,
@@ -6983,6 +8220,14 @@ class Bot:
             incoming = dict(payload or {})
             out = dict(self._last_live_status_payload)
             prev_symbol = str(out.get("symbol", "") or "").strip()
+            prev_price = _safe_float(out.get("price"), 0.0)
+            prev_sma = _safe_float(out.get("sma"), 0.0)
+            prev_deviation = _safe_float(out.get("deviation"), 0.0)
+            prev_expected_edge_pct = _safe_float(out.get("expected_edge_pct"), 0.0)
+            prev_min_expected_edge_pct = _safe_float(out.get("min_expected_edge_pct"), 0.0)
+            prev_ai_entry_quality = _safe_float(out.get("ai_entry_quality"), 0.0)
+            prev_ai_entry_min_quality = _safe_float(out.get("ai_entry_min_quality"), 0.0)
+            prev_human_reason = str(out.get("human_reason", "") or "")
             prev_has_open_position = bool(out.get("has_open_position", False))
             out.update(incoming)
             incoming_event = str(incoming.get("event", "") or "").strip().lower()
@@ -7036,6 +8281,25 @@ class Bot:
                 src_key = _symbol_key(src_symbol)
                 out_key = _symbol_key(out_symbol)
                 has_pos_busy = bool(incoming.get("has_open_position", out.get("has_open_position", False)))
+                if (not symbol_changed) and (not src_key or src_key == out_key):
+                    if _safe_float(incoming.get("price"), 0.0) <= 0.0 and prev_price > 0.0:
+                        out["price"] = prev_price
+                    if _safe_float(incoming.get("sma"), 0.0) <= 0.0 and prev_sma > 0.0:
+                        out["sma"] = prev_sma
+                    if abs(_safe_float(incoming.get("deviation"), 0.0)) <= 0.0 and abs(prev_deviation) > 0.0:
+                        out["deviation"] = prev_deviation
+                    if _safe_float(incoming.get("expected_edge_pct"), 0.0) == 0.0 and prev_expected_edge_pct != 0.0:
+                        out["expected_edge_pct"] = prev_expected_edge_pct
+                    if _safe_float(incoming.get("min_expected_edge_pct"), 0.0) == 0.0 and prev_min_expected_edge_pct > 0.0:
+                        out["min_expected_edge_pct"] = prev_min_expected_edge_pct
+                    if _safe_float(incoming.get("ai_entry_quality"), 0.0) == 0.0 and prev_ai_entry_quality > 0.0:
+                        out["ai_entry_quality"] = prev_ai_entry_quality
+                    if _safe_float(incoming.get("ai_entry_min_quality"), 0.0) == 0.0 and prev_ai_entry_min_quality > 0.0:
+                        out["ai_entry_min_quality"] = prev_ai_entry_min_quality
+                elif symbol_changed:
+                    out["price"] = 0.0
+                    out["sma"] = 0.0
+                    out["deviation"] = 0.0
                 if src_key and out_key and src_key != out_key:
                     # Do not leak stale quote from previous symbol while new symbol is being prepared.
                     out["price"] = _safe_float(incoming.get("price"), 0.0)
@@ -7105,7 +8369,25 @@ class Bot:
             # Heartbeat freshness must always move forward, even for merged payloads.
             out["status_write_ts_utc"] = now_utc
             out["ts_utc"] = now_utc
-            out["human_reason"] = _repair_mojibake_ru(build_human_reason(out))
+            human_reason = _repair_mojibake_ru(build_human_reason(out))
+            human_reason = _repair_mojibake_ru(human_reason)
+            if _is_mojibake_ru(human_reason):
+                if bool(out.get("has_open_position", False)):
+                    sell_reason = str(out.get("sell_reason", "") or "").strip()
+                    if sell_reason:
+                        human_reason = f"Позиция открыта: ожидается условие выхода ({self._human_sell_reason(sell_reason)})."
+                    else:
+                        human_reason = "Позиция открыта: бот сопровождает сделку."
+                elif str(out.get("event", "") or "").strip().lower() in {"entry_blocked", "risk_guard_blocked"}:
+                    human_reason = "Условия входа не выполнены."
+                elif str(out.get("event", "") or "").strip().lower() == "market_data_unavailable":
+                    human_reason = "Нет корректных рыночных данных: бот временно пропускает вход."
+                else:
+                    human_reason = "Подходящих условий для сделки пока нет."
+            if _is_mojibake_ru(human_reason) and prev_human_reason and not _is_mojibake_ru(prev_human_reason):
+                human_reason = prev_human_reason
+            out["human_reason"] = human_reason
+            out = _repair_payload_text_ru(out)
             path = Path(self.config.BOT_LIVE_STATUS_PATH)
             if not path.is_absolute():
                 path = APP_BASE_DIR / path
@@ -7121,10 +8403,21 @@ class Bot:
                         existing_pid = int(_safe_float(existing.get("bot_pid"), 0.0))
                         existing_ts = _iso_to_ts(existing.get("status_write_ts_utc") or existing.get("ts_utc"))
                         existing_age = max(0.0, time.time() - existing_ts) if existing_ts > 0 else 9999.0
+                        owner_pid = 0
+                        try:
+                            proc_lock_path = Path(self.config.BOT_PROCESS_LOCK_PATH)
+                            if not proc_lock_path.is_absolute():
+                                proc_lock_path = APP_BASE_DIR / proc_lock_path
+                            if proc_lock_path.exists():
+                                lock_payload = json.loads(proc_lock_path.read_text(encoding="utf-8-sig"))
+                                owner_pid = int(_safe_float(lock_payload.get("pid"), 0.0))
+                        except Exception:
+                            owner_pid = 0
                         if (
                             existing_pid > 0
                             and existing_pid != os.getpid()
                             and _pid_alive(existing_pid)
+                            and owner_pid != os.getpid()
                             and existing_age <= max(10.0, float(self.config.SLEEP_SECONDS) * 3.0)
                         ):
                             return
@@ -7136,8 +8429,13 @@ class Bot:
                     self._last_has_open_position = bool(out.get("has_open_position", False))
                 if "event" in out:
                     self._last_cycle_event = str(out.get("event", self._last_cycle_event))
-        except Exception:
+        except Exception as exc:
             # Live status is observability only and must not break trading.
+            now_ts = time.time()
+            last_warn_ts = _safe_float(getattr(self, "_last_live_status_write_error_ts", 0.0), 0.0)
+            if now_ts - last_warn_ts >= 60.0:
+                logging.warning("Live status write failed: %s", exc)
+                self._last_live_status_write_error_ts = now_ts
             return
 
     def _setup_signal_handlers(self):
@@ -7202,35 +8500,27 @@ def setup_logging(config: Config):
     if not log_path.is_absolute():
         log_path = APP_BASE_DIR / log_path
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path = Path(config.AUDIT_LOG_PATH)
+    if not audit_path.is_absolute():
+        audit_path = APP_BASE_DIR / audit_path
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Lightweight log rotation keeps runtime logs fast to read in GUI/live monitor.
     try:
-        max_bytes = 5 * 1024 * 1024  # 5 MB
-        if log_path.exists() and log_path.stat().st_size > max_bytes:
-            archive_dir = log_path.parent / "archive"
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            archived = archive_dir / f"{log_path.stem}_{ts}{log_path.suffix}"
-            log_path.replace(archived)
-            # Keep archive folder bounded.
-            archived_files = sorted(
-                archive_dir.glob(f"{log_path.stem}_*{log_path.suffix}"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            for old in archived_files[25:]:
-                try:
-                    old.unlink()
-                except Exception:
-                    pass
+        _rotate_runtime_file(log_path, max_bytes=5 * 1024 * 1024, keep_archives=25)
+        _rotate_runtime_file(audit_path, max_bytes=12 * 1024 * 1024, keep_archives=18)
     except Exception:
         # Rotation issues must not block bot start.
         pass
 
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8-sig")
+    file_handler.setFormatter(formatter)
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(log_path, encoding="utf-8")],
+        handlers=[stream_handler, file_handler],
         force=True,
     )
     try:
@@ -7238,6 +8528,27 @@ def setup_logging(config: Config):
         root = logging.getLogger()
         for h in root.handlers:
             h.addFilter(flt)
+    except Exception:
+        pass
+    try:
+        # Repair mojibake at record creation time to catch early/bare loggers too.
+        old_factory = logging.getLogRecordFactory()
+
+        def _record_factory(*args: object, **kwargs: object) -> logging.LogRecord:
+            record = old_factory(*args, **kwargs)
+            try:
+                if isinstance(record.msg, str):
+                    record.msg = _repair_mojibake_ru(record.msg)
+                if getattr(record, "args", None):
+                    fixed_args = []
+                    for a in record.args:
+                        fixed_args.append(_repair_mojibake_ru(a) if isinstance(a, str) else a)
+                    record.args = tuple(fixed_args)
+            except Exception:
+                pass
+            return record
+
+        logging.setLogRecordFactory(_record_factory)
     except Exception:
         pass
     try:
@@ -7264,6 +8575,7 @@ def setup_logging(config: Config):
 def main():
     """Main entry point."""
     _force_utf8_stdio()
+    load_env_layers(APP_BASE_DIR, override=False)
     config = Config()
     setup_logging(config)
     adaptive_state_path = Path(config.AI_ADAPTIVE_STATE_PATH)
