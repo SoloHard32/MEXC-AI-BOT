@@ -29,6 +29,27 @@
 - Экспорт/импорт AI-бандла
 - Переключение языка интерфейса (`RU / EN`)
 
+### Последние обновления
+
+- Улучшена стабильность desktop GUI:
+  - исправлен пустой/зависший экран после старта
+  - добавлена более надёжная обработка stale runtime-state и раннего падения backend-процесса
+- Улучшена телеметрия:
+  - добавлены `signal_reason` и `signal_explainer`
+  - причины отсутствия входа стали понятнее в GUI и audit
+  - телеметрия пары показывается только во время открытой позиции
+- Добавлен `data_quality_score`:
+  - бот оценивает качество market-data
+  - низкое качество данных теперь учитывается в entry-policy
+- Расширен `trade_audit.jsonl`:
+  - пишутся `signal_reason`, `signal_explainer`, `no_entry_reasons`, `data_quality_score`
+- Добавлен офлайн-анализатор:
+  - `analyze_audit.py` строит сводку по audit-логу в `logs/reports/audit_summary.json`
+- Улучшены training/runtime механики:
+  - мягче anti-deadlock relax
+  - устойчивее universe scan
+  - лучше защита от REST-degradation и stale market-data
+
 ### Что внутри
 
 Основные файлы:
@@ -43,6 +64,10 @@
 - `position_overlays.py` — overlay-логика сопровождения позиции
 - `model_evolver.py` — эволюция/регистрация модели
 - `ui_dashboard/` — веб-интерфейс дашборда
+- `core/` — основные внутренние модули торговой логики
+- `services/` — сервисные процессы и mock/runtime сервисы
+- `tools/` — вспомогательные утилиты
+- `analyze_audit.py` — быстрый анализатор audit-лога
 
 ### Требования
 
@@ -87,6 +112,7 @@ python mexc_bot_gui.py
 - `logs/runtime/` — runtime-логи и live status
 - `logs/training/` — модели и логи обучения
 - `logs/reports/` — health/session отчеты
+- `logs/reports/audit_summary.json` — агрегированная сводка по audit после запуска `analyze_audit.py`
 
 ### Безопасность
 
@@ -135,6 +161,27 @@ Autonomous AI trading bot for MEXC Spot with desktop GUI (PySide6 + WebView), li
 - AI bundle export/import
 - UI language switch (`RU / EN`)
 
+### Recent Updates
+
+- Improved desktop GUI stability:
+  - fixed empty/frozen screen after start
+  - added safer stale runtime-state cleanup and early backend-exit handling
+- Better telemetry:
+  - added `signal_reason` and `signal_explainer`
+  - clearer no-entry reasons in GUI and audit
+  - pair telemetry is shown only while a position is open
+- Added `data_quality_score`:
+  - market-data quality is scored in runtime
+  - low data quality is now part of entry-policy decisions
+- Extended `trade_audit.jsonl`:
+  - now includes `signal_reason`, `signal_explainer`, `no_entry_reasons`, `data_quality_score`
+- Added offline audit analysis:
+  - `analyze_audit.py` builds `logs/reports/audit_summary.json`
+- Improved training/runtime behavior:
+  - softer anti-deadlock relax
+  - more stable universe scan
+  - stronger protection against REST degradation and stale market-data
+
 ### Project Layout
 
 Key files:
@@ -149,6 +196,10 @@ Key files:
 - `position_overlays.py` — position management overlays
 - `model_evolver.py` — model evolution/registry
 - `ui_dashboard/` — dashboard frontend
+- `core/` — core trading logic modules
+- `services/` — service processes and runtime/mock services
+- `tools/` — helper utilities
+- `analyze_audit.py` — quick audit log analyzer
 
 ### Requirements
 

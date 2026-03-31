@@ -13,7 +13,6 @@
       <div id="brandTitle" class="brand">MEXC AI BOT v1.0</div>
       <div class="top-meta">
         <span id="connBadge" class="badge">-</span>
-        <span id="advisoryBadge" class="badge">Advisory: -</span>
         <span id="tsText" class="chip">Обновление: -</span>
         <span id="modeText" class="chip">Режим: -</span>
         <span id="marketText" class="chip">SPOT/MEXC</span>
@@ -33,22 +32,9 @@
             <button id="btnRestart" data-act="restartBot" title="Полный перезапуск приложения">Рестарт</button>
             <button id="btnSave" data-act="saveSettings" title="Сохранить текущий режим и настройки GUI">Сохранить</button>
             <button id="btnLogs" data-act="openLogFile" title="Открыть полный runtime лог-файл">Логи</button>
-            <button id="btnHealth" data-act="refreshHealth" title="Сформировать health_report.json">Health</button>
-          </div>
-          <div class="control-toggle-row">
-            <button id="btnSafeReset" data-act="safeReset" title="Очистить только runtime-кэш, не трогая модель">Safe reset</button>
-          </div>
-          <div class="control-toggle-row">
             <button id="openLiveBtn" type="button" title="Открыть live-монитор в стиле панели">Live окно</button>
-            <button id="openAdvBtn" type="button" title="API ключи и служебные параметры">Расширенные настройки</button>
-          </div>
-          <div class="control-toggle-row">
-            <button id="btnOpenReport" data-act="openHealth" title="Открыть последний health report">Открыть report</button>
-            <button id="btnReportsDir" data-act="openReportsDir" title="Открыть папку с отчетами">Папка reports</button>
-          </div>
-          <div class="control-toggle-row">
-            <button id="btnExportAi" data-act="exportAi" title="Экспорт модели и состояния AI в zip">Экспорт AI</button>
-            <button id="btnImportAi" data-act="importAi" title="Импорт модели и состояния AI из zip">Импорт AI</button>
+            <button id="openAdvBtn" type="button" title="API, язык и учебный баланс">Настройки</button>
+            <button id="btnReportsDir" data-act="openReportsDir" title="Открыть папку с отчетами">Reports</button>
           </div>
           <div class="mode-line">
             <span id="modeLabel" class="k">Режим:</span>
@@ -125,37 +111,6 @@
           </summary>
           <div class="card-content">
             <div class="kv" id="marketCard"></div>
-          </div>
-        </details>
-        <details class="card right-collapsible" data-right-key="ops">
-          <summary>
-            <h3 id="hOps">Системная телеметрия</h3>
-            <span class="chev" aria-hidden="true">▸</span>
-          </summary>
-          <div class="card-content">
-            <div class="kv" id="opsCard"></div>
-            <div class="meter-stack">
-              <div class="meter-row">
-                <span id="lblCycleHealth" class="k">Стабильность цикла</span>
-                <span id="cycleHealthText" class="v">0%</span>
-              </div>
-              <div class="meter"><div id="cycleHealthBar" class="meter-fill"></div></div>
-              <div class="meter-row">
-                <span id="lblDecisionHealth" class="k">Качество решений</span>
-                <span id="decisionHealthText" class="v">0%</span>
-              </div>
-              <div class="meter"><div id="decisionHealthBar" class="meter-fill"></div></div>
-            </div>
-            <div id="opsHints" class="ops-hints">Ожидание телеметрии...</div>
-          </div>
-        </details>
-        <details class="card right-collapsible" data-right-key="session">
-          <summary>
-            <h3 id="hSession">Сессия сейчас</h3>
-            <span class="chev" aria-hidden="true">▸</span>
-          </summary>
-          <div class="card-content">
-            <div class="kv" id="sessionCard"></div>
           </div>
         </details>
         <details class="card right-collapsible" data-right-key="guard">
@@ -241,10 +196,6 @@
           <div class="card">
             <h3>Риск / Баланс</h3>
             <div id="liveRisk" class="kv"></div>
-          </div>
-          <div class="card">
-            <h3>Последние ордера</h3>
-            <div id="liveOrders" class="bottom-events">Нет данных</div>
           </div>
         </div>
       </div>

@@ -17,30 +17,120 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot, Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMessageBox, QDialog, QTextEdit, QVBoxLayout
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
+from env_utils import env_file_paths, load_env_layers, read_env_file, read_env_layers, upsert_env_layers
 from live_reason_mapper import build_human_reason
 
-BASE_DIR = Path(__file__).resolve().parent
-BOT_PATH = BASE_DIR / "mexc_bot.py"
-ENGINE_SERVICE_PATH = BASE_DIR / "rust_engine_service.py"
-ADVISORY_MOCK_SERVICE_PATH = BASE_DIR / "advisory_mock_server.py"
-SETTINGS_PATH = BASE_DIR / "gui_settings.json"
-ENV_PATH = BASE_DIR / ".env"
-LIVE_PATH = BASE_DIR / "logs" / "runtime" / "bot_live_status.json"
-AI_PATH = BASE_DIR / "logs" / "training" / "ai_status.json"
-LOG_PATH = BASE_DIR / "logs" / "runtime" / "mexc_bot.log"
-TELEMETRY_PATH = BASE_DIR / "logs" / "runtime" / "bot_telemetry.json"
-REPORT_PATH = BASE_DIR / "logs" / "reports" / "health_report.json"
-SESSION_REPORT_PATH = BASE_DIR / "logs" / "reports" / "session_report.json"
-REPORTS_DIR = BASE_DIR / "logs" / "reports"
-RUNTIME_DIR = BASE_DIR / "logs" / "runtime"
-TRAINING_DIR = BASE_DIR / "logs" / "training"
-UI_INDEX = BASE_DIR / "ui_dashboard" / "index.html"
-AUDIT_PATH = BASE_DIR / "logs" / "runtime" / "trade_audit.jsonl"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
+RESOURCE_DIR = APP_DIR / "_internal" if IS_FROZEN and (APP_DIR / "_internal").exists() else APP_DIR
+BASE_DIR = APP_DIR
+BOT_PATH = APP_DIR / "mexc_bot.py"
+ENGINE_SERVICE_PATH = APP_DIR / "rust_engine_service.py"
+ADVISORY_MOCK_SERVICE_PATH = APP_DIR / "advisory_mock_server.py"
+SETTINGS_PATH = APP_DIR / "gui_settings.json"
+ENV_PATH, LOCAL_ENV_PATH = env_file_paths(APP_DIR)
+REPORTS_DIR = APP_DIR / "logs" / "reports"
+RUNTIME_DIR = APP_DIR / "logs" / "runtime"
+TRAINING_DIR = APP_DIR / "logs" / "training"
+LIVE_PATH = RUNTIME_DIR / "bot_live_status.json"
+AI_PATH = TRAINING_DIR / "ai_status.json"
+LOG_PATH = RUNTIME_DIR / "mexc_bot.log"
+TELEMETRY_PATH = RUNTIME_DIR / "bot_telemetry.json"
+REPORT_PATH = REPORTS_DIR / "health_report.json"
+SESSION_REPORT_PATH = REPORTS_DIR / "session_report.json"
+UI_INDEX = APP_DIR / "ui_dashboard" / "index.html"
+AUX_UI_INDEX = RESOURCE_DIR / "ui_dashboard" / "index.html"
+AUDIT_PATH = RUNTIME_DIR / "trade_audit.jsonl"
+
+
+def _child_command(script_path: Path, internal_flag: str, *extra_args: str) -> list[str]:
+    if IS_FROZEN:
+        return [sys.executable, internal_flag, *extra_args]
+    return [sys.executable, "-u", str(script_path), *extra_args]
+
+
+def _bootstrap_packaged_files() -> None:
+    if not IS_FROZEN:
+        return
+
+    for path in (REPORTS_DIR, RUNTIME_DIR, TRAINING_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+
+    file_pairs = (
+        (RESOURCE_DIR / ".env", ENV_PATH),
+        (RESOURCE_DIR / "gui_settings.json", SETTINGS_PATH),
+    )
+    for src, dst in file_pairs:
+        try:
+            if src.exists() and not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        except Exception:
+            pass
+
+    dir_pairs = (
+        (RESOURCE_DIR / "ui_dashboard", APP_DIR / "ui_dashboard"),
+        (RESOURCE_DIR / "logs" / "training", APP_DIR / "logs" / "training"),
+        (RESOURCE_DIR / "logs" / "reports", APP_DIR / "logs" / "reports"),
+    )
+    for src, dst in dir_pairs:
+        try:
+            if src.exists() and not dst.exists():
+                shutil.copytree(src, dst)
+        except Exception:
+            pass
+
+
+def _read_pid_from_lock(path: Path) -> int:
+    try:
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
+        data = json.loads(raw) if raw.strip() else {}
+        if isinstance(data, dict):
+            return int(_safe_float(data.get("pid"), 0.0))
+    except Exception:
+        pass
+    return 0
+
+
+def _cleanup_stale_runtime_state() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    lock_files = (
+        RUNTIME_DIR / "bot_process.lock",
+        RUNTIME_DIR / "rust_engine_service.lock",
+    )
+    for path in lock_files:
+        try:
+            if path.exists():
+                pid = _read_pid_from_lock(path)
+                if pid <= 0 or not _pid_alive(pid):
+                    path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    try:
+        live = _read_json(LIVE_PATH)
+        live_pid = int(_safe_float(live.get("bot_pid") or live.get("writer_pid"), 0.0))
+        if live and (live_pid <= 0 or not _pid_alive(live_pid)):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            live["status"] = "stopped"
+            live["event"] = "gui_runtime_recovered"
+            live["human_reason"] = "Старый runtime-кэш очищен: активный процесс бота не найден."
+            live["bot_pid"] = 0
+            live["writer_pid"] = 0
+            live["cycle_index"] = 0
+            live["sleep_remaining_sec"] = 0.0
+            live["cooldown_remaining_sec"] = 0
+            live["status_write_ts_utc"] = now_iso
+            live["ts_utc"] = now_iso
+            _write_json_atomic(LIVE_PATH, live)
+    except Exception:
+        pass
 
 
 def _hide_windows_console() -> None:
@@ -57,6 +147,18 @@ def _hide_windows_console() -> None:
     except Exception:
         # Non-fatal: GUI should still start if hide call is unavailable.
         pass
+
+
+def _hidden_run_kwargs() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
 
 
 def _safe_float(v: Any, d: float = 0.0) -> float:
@@ -127,22 +229,6 @@ def _tail_text_lines(path: Path, max_lines: int = 500, max_bytes: int = 300_000)
         return [_repair_mojibake_ru(ln) for ln in lines[-max_lines:]]
     except Exception:
         return []
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
-    if not path.exists():
-        return out
-    try:
-        for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            out[k.strip()] = v.strip()
-    except Exception:
-        return {}
-    return out
 
 
 def _fmt_price(v: float) -> str:
@@ -313,10 +399,13 @@ class LiveMonitorDialog(QDialog):
 
 
 class BotWebWindow(QMainWindow):
+    uiThreadCall = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("MEXC AI BOT v1.0")
         self.resize(1660, 900)
+        load_env_layers(APP_DIR, override=False)
 
         self.process: subprocess.Popen | None = None
         self.engine_process: subprocess.Popen | None = None
@@ -359,6 +448,7 @@ class BotWebWindow(QMainWindow):
         self._last_bot_start_ts = 0.0
         self._last_session_report_ts = 0.0
         self._last_dup_kill_ts = 0.0
+        self._last_proc_guard_scan_ts = 0.0
 
         self.view = QWebEngineView(self)
         # Lock UI scale to a fixed value so layout always opens in the same visual size.
@@ -370,6 +460,7 @@ class BotWebWindow(QMainWindow):
         self.channel.registerObject("botBridge", self.bridge)
         self.view.page().setWebChannel(self.channel)
 
+        _cleanup_stale_runtime_state()
         self._load_settings()
         self._ensure_ui_files()
         self.view.setUrl(QUrl.fromLocalFile(str(UI_INDEX)))
@@ -387,6 +478,68 @@ class BotWebWindow(QMainWindow):
         self.proc_watchdog_timer = QTimer(self)
         self.proc_watchdog_timer.timeout.connect(self._check_proc_op_timeout)
         self.proc_watchdog_timer.start(1000)
+        self.uiThreadCall.connect(self._handle_ui_thread_call)
+
+    @Slot(str)
+    def _handle_ui_thread_call(self, action: str) -> None:
+        act = str(action or "").strip().lower()
+        if act == "post_start_guards":
+            QTimer.singleShot(900, lambda: self._enforce_single_bot_process(force=True))
+            QTimer.singleShot(2200, lambda: self._enforce_single_bot_process(force=True))
+            QTimer.singleShot(4200, lambda: self._enforce_single_bot_process(force=True))
+        elif act == "post_restart_guards":
+            QTimer.singleShot(1200, lambda: self._enforce_single_bot_process(force=True))
+            QTimer.singleShot(3000, lambda: self._enforce_single_bot_process(force=True))
+
+    @staticmethod
+    def _normalize_chart_candles(candles: Any, limit: int = 120) -> list[dict[str, float]]:
+        if not isinstance(candles, list):
+            return []
+        by_ts: dict[int, dict[str, float]] = {}
+        for item in candles:
+            if not isinstance(item, dict):
+                continue
+            ts = int(_safe_float(item.get("ts"), 0.0))
+            o = _safe_float(item.get("o"), 0.0)
+            h = _safe_float(item.get("h"), 0.0)
+            l = _safe_float(item.get("l"), 0.0)
+            c = _safe_float(item.get("c"), 0.0)
+            v = _safe_float(item.get("v"), 0.0)
+            if ts <= 0 or h <= 0 or l <= 0 or c <= 0:
+                continue
+            by_ts[ts] = {
+                "ts": float(ts),
+                "o": o,
+                "h": h,
+                "l": l,
+                "c": c,
+                "v": max(0.0, v),
+            }
+        if not by_ts:
+            return []
+        out = [by_ts[k] for k in sorted(by_ts)]
+        return out[-max(20, int(limit)):]
+
+    def _resolve_chart_candles(self, symbol: str, incoming: Any) -> list[dict[str, float]]:
+        chart_symbol = _sym(str(symbol or "-"))
+        normalized = self._normalize_chart_candles(incoming, limit=120)
+        if chart_symbol != self._last_chart_symbol:
+            self._last_chart_symbol = chart_symbol
+            self._last_chart_candles = []
+        cached = list(self._last_chart_candles)
+        if not normalized:
+            return cached
+        if not cached:
+            self._last_chart_candles = normalized
+            return normalized
+
+        suspicious_shrink = len(normalized) < max(12, int(len(cached) * 0.45))
+        merged = self._normalize_chart_candles(cached + normalized, limit=120)
+        if suspicious_shrink and len(merged) >= len(cached):
+            self._last_chart_candles = merged
+            return merged
+        self._last_chart_candles = merged if len(merged) >= len(normalized) else normalized
+        return list(self._last_chart_candles)
 
     def _write_gui_live_status(self, *, event_name: str, note: str = "") -> None:
         """
@@ -500,7 +653,7 @@ class BotWebWindow(QMainWindow):
 
     def _list_foreign_bot_pids(self, exclude_pid: int | None = None) -> list[int]:
         """
-        Return running python process IDs that execute this exact BOT_PATH script,
+        Return running python/pythonw process IDs that execute this exact BOT_PATH script,
         excluding current GUI process and optional exclude_pid.
         """
         target = str(BOT_PATH.resolve()).lower().replace("/", "\\")
@@ -515,7 +668,7 @@ class BotWebWindow(QMainWindow):
             if os.name == "nt":
                 ps_cmd = (
                     "Get-CimInstance Win32_Process | "
-                    "Where-Object { $_.Name -match '^python(\\\\.exe)?$' } | "
+                    "Where-Object { $_.Name -match '^pythonw?(\\\\.exe)?$' } | "
                     "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
                 )
                 cp = subprocess.run(
@@ -525,6 +678,7 @@ class BotWebWindow(QMainWindow):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    **_hidden_run_kwargs(),
                 )
                 raw = (cp.stdout or "").strip()
                 if not raw:
@@ -596,6 +750,7 @@ class BotWebWindow(QMainWindow):
                     check=False,
                     capture_output=True,
                     text=True,
+                    **_hidden_run_kwargs(),
                 )
             except Exception:
                 pass
@@ -615,19 +770,26 @@ class BotWebWindow(QMainWindow):
 
     def _enforce_single_bot_process(self, force: bool = False) -> int:
         now_ts = time.time()
-        if (not force) and (now_ts - self._last_dup_kill_ts) < 1.5:
+        if (not force) and (now_ts - self._last_proc_guard_scan_ts) < 15.0:
             return 0
         with self._proc_lock:
             keep_pid = int(self.process.pid) if (self.process and self.process.poll() is None) else None
         killed = self._stop_foreign_bot_processes(keep_pid=keep_pid)
+        self._last_proc_guard_scan_ts = now_ts
         self._last_dup_kill_ts = now_ts
         if killed > 0:
             self._append_log(f"[GUI-WEB] Auto-guard: остановлено лишних процессов бота: {killed}")
         return killed
 
     def _ensure_ui_files(self) -> None:
-        ui_dir = BASE_DIR / "ui_dashboard"
+        _bootstrap_packaged_files()
+        ui_dir = APP_DIR / "ui_dashboard"
         ui_dir.mkdir(parents=True, exist_ok=True)
+        if not UI_INDEX.exists() and AUX_UI_INDEX.exists():
+            try:
+                shutil.copytree(AUX_UI_INDEX.parent, ui_dir, dirs_exist_ok=True)
+            except Exception:
+                pass
         if not UI_INDEX.exists():
             raise FileNotFoundError(f"UI file not found: {UI_INDEX}")
 
@@ -650,6 +812,11 @@ class BotWebWindow(QMainWindow):
             self._log_signal.append(s)
         if any(k in sl for k in ("error", "warning", "exception", "traceback", "timeout", "fail")):
             self._log_error.append(s)
+
+    def _write_report_files(self, report: dict[str, Any], session_report: dict[str, Any]) -> None:
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(REPORT_PATH, report)
+        _write_json_atomic(SESSION_REPORT_PATH, session_report)
 
     def _load_settings(self) -> None:
         cfg = _read_json(SETTINGS_PATH)
@@ -684,6 +851,8 @@ class BotWebWindow(QMainWindow):
                 shutil.copy2(SETTINGS_PATH, backup_dir / f"gui_settings_{ts}.json.bak")
             if ENV_PATH.exists():
                 shutil.copy2(ENV_PATH, backup_dir / f".env_{ts}.bak")
+            if LOCAL_ENV_PATH.exists():
+                shutil.copy2(LOCAL_ENV_PATH, backup_dir / f".env.local_{ts}.bak")
             SETTINGS_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
             self._append_log("[GUI-WEB] Настройки сохранены")
             self._emit_toast("Настройки сохранены", "ok")
@@ -694,7 +863,7 @@ class BotWebWindow(QMainWindow):
     def _bot_env(self) -> dict[str, str]:
         env = os.environ.copy()
         cfg = _read_json(SETTINGS_PATH)
-        env_file = _read_env_file(ENV_PATH)
+        env_file = read_env_layers(APP_DIR)
         for k, v in env_file.items():
             env[k] = v
         for k, v in cfg.items():
@@ -758,7 +927,7 @@ class BotWebWindow(QMainWindow):
             return False
 
     def _ensure_engine_service_running(self) -> None:
-        env_file = _read_env_file(ENV_PATH)
+        env_file = read_env_layers(APP_DIR)
         cfg = _read_json(SETTINGS_PATH)
         backend = str(cfg.get("ENGINE_BACKEND", env_file.get("ENGINE_BACKEND", "python")) or "python").strip().lower()
         auto_start = str(cfg.get("AUTO_START_ENGINE_SERVICE", env_file.get("AUTO_START_ENGINE_SERVICE", "true")) or "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -779,7 +948,7 @@ class BotWebWindow(QMainWindow):
                 startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
                 startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
             proc = subprocess.Popen(
-                [sys.executable, "-u", str(ENGINE_SERVICE_PATH)],
+                _child_command(ENGINE_SERVICE_PATH, "--run-engine-service"),
                 cwd=str(BASE_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -871,7 +1040,14 @@ class BotWebWindow(QMainWindow):
                 startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
                 startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
             proc = subprocess.Popen(
-                [sys.executable, "-u", str(ADVISORY_MOCK_SERVICE_PATH), "--host", host, "--port", str(port)],
+                _child_command(
+                    ADVISORY_MOCK_SERVICE_PATH,
+                    "--run-advisory-mock",
+                    "--host",
+                    host,
+                    "--port",
+                    str(port),
+                ),
                 cwd=str(BASE_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -922,13 +1098,14 @@ class BotWebWindow(QMainWindow):
         if running:
             self._emit_toast("Бот уже запущен", "warn")
             return
-        if not BOT_PATH.exists():
+        if not IS_FROZEN and not BOT_PATH.exists():
             self._emit_toast(f"Не найден {BOT_PATH}", "err")
             return
         try:
+            _cleanup_stale_runtime_state()
             if self.mode == "training":
                 cfg = _read_json(SETTINGS_PATH)
-                env_vals = _read_env_file(ENV_PATH)
+                env_vals = read_env_layers(APP_DIR)
                 paper_start = _safe_float(cfg.get("PAPER_START_USDT", env_vals.get("PAPER_START_USDT", "100.0")), 100.0)
                 self._apply_paper_balance_now(paper_start, force=True)
             self._ensure_engine_service_running()
@@ -946,7 +1123,7 @@ class BotWebWindow(QMainWindow):
                 startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
                 startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
             proc = subprocess.Popen(
-                [sys.executable, "-u", str(BOT_PATH)],
+                _child_command(BOT_PATH, "--run-bot"),
                 cwd=str(BASE_DIR),
                 env=bot_env,
                 stdout=subprocess.PIPE,
@@ -979,13 +1156,14 @@ class BotWebWindow(QMainWindow):
             self._watchdog_busy_count = 0
             self._watchdog_same_status_count = 0
             self._watchdog_last_status_ts = ""
-            threading.Thread(target=self._read_process_output, daemon=True).start()
+            threading.Thread(target=self._read_process_output, args=(proc,), daemon=True).start()
+            time.sleep(0.35)
+            if proc.poll() is not None:
+                raise RuntimeError(f"Процесс бота завершился сразу после запуска (код {proc.returncode})")
             self._stop_foreign_bot_processes(keep_pid=int(proc.pid))
             self._enforce_single_bot_process(force=True)
-            # Post-start race guard: catch delayed orphan/duplicate respawns.
-            QTimer.singleShot(900, lambda: self._enforce_single_bot_process(force=True))
-            QTimer.singleShot(2200, lambda: self._enforce_single_bot_process(force=True))
-            QTimer.singleShot(4200, lambda: self._enforce_single_bot_process(force=True))
+            # Post-start race guard: catch delayed orphan/duplicate respawns on the GUI thread.
+            self.uiThreadCall.emit("post_start_guards")
         except Exception as exc:
             self._append_log(f"[GUI-WEB] Ошибка запуска: {exc}")
             self._emit_toast(f"Ошибка запуска: {exc}", "err")
@@ -1023,8 +1201,8 @@ class BotWebWindow(QMainWindow):
                     try:
                         proc.kill()
                         proc.wait(timeout=2.0)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._append_log(f"[GUI-WEB] Не удалось принудительно завершить процесс: {exc}")
             if proc.poll() is None:
                 self._kill_pid_hard(int(proc.pid))
             self._append_log("[GUI-WEB] Бот остановлен")
@@ -1058,20 +1236,25 @@ class BotWebWindow(QMainWindow):
             if killed > 0:
                 self._append_log(f"[GUI-WEB] Остановлено сторонних процессов перед перезапуском: {killed}")
             self._start_bot_impl()
-            QTimer.singleShot(1200, lambda: self._enforce_single_bot_process(force=True))
-            QTimer.singleShot(3000, lambda: self._enforce_single_bot_process(force=True))
+            self.uiThreadCall.emit("post_restart_guards")
         except Exception as exc:
             self._append_log(f"[GUI-WEB] Ошибка перезапуска бота: {exc}")
             self._emit_toast(f"Ошибка перезапуска: {exc}", "err")
 
-    def _read_process_output(self) -> None:
-        if not self.process or not self.process.stdout:
+    def _read_process_output(self, proc: subprocess.Popen[str]) -> None:
+        stream = proc.stdout
+        if not stream:
             return
         try:
-            for line in self.process.stdout:
+            for line in stream:
                 self.log_queue.put(line.rstrip("\n"))
         except Exception as exc:
             self.log_queue.put(f"[GUI-WEB] Ошибка чтения: {exc}")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def _drain_log_queue(self) -> None:
         drained = 0
@@ -1083,9 +1266,11 @@ class BotWebWindow(QMainWindow):
         except queue.Empty:
             pass
         if self.process and self.process.poll() is not None:
-            self._append_log(f"[GUI-WEB] Бот завершился с кодом {self.process.returncode}")
+            return_code = self.process.returncode
+            self._append_log(f"[GUI-WEB] Бот завершился с кодом {return_code}")
             self.process = None
             self.runtime_mode = None
+            self._write_gui_live_status(event_name="gui_stopped", note=f"Бот завершился с кодом {return_code}.")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         try:
@@ -1201,8 +1386,8 @@ class BotWebWindow(QMainWindow):
             if isinstance(live.get("advisory_provider_status"), dict)
             else {}
         )
-        if not _read_env_file(ENV_PATH).get("MEXC_API_KEY"):
-            recommendations.append("API ключ не задан в .env.")
+        if not read_env_layers(APP_DIR).get("MEXC_API_KEY"):
+            recommendations.append("API ключ не задан в .env/.env.local.")
         if stale_age > 30:
             recommendations.append(f"Live-статус устарел ({stale_age:.1f} сек).")
         if _safe_int(rg.get("api_error_count_window")) >= max(2, _safe_int(rg.get("api_soft_guard_max_errors")) - 1):
@@ -1247,9 +1432,7 @@ class BotWebWindow(QMainWindow):
             "recommendations": recommendations,
         }
         try:
-            REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-            REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-            SESSION_REPORT_PATH.write_text(json.dumps(session_report, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._write_report_files(report, session_report)
             if not quiet:
                 self._append_log(f"[GUI-WEB] Health report обновлен: {REPORT_PATH}")
                 self._append_log(f"[GUI-WEB] Session report обновлен: {SESSION_REPORT_PATH}")
@@ -1544,7 +1727,7 @@ class BotWebWindow(QMainWindow):
         self.live_dialog.text.setPlainText(f"{header}\n\n{payload}\n\n=== LOG TAIL ===\n{tail}")
 
     def get_api_settings_json(self) -> str:
-        env = _read_env_file(ENV_PATH)
+        env = read_env_layers(APP_DIR)
         cfg = _read_json(SETTINGS_PATH)
         paper_start = str(cfg.get("PAPER_START_USDT", env.get("PAPER_START_USDT", "100.000000")) or "100.000000").strip()
         ui_lang = str(cfg.get("UI_LANGUAGE", self._ui_state.get("lang", "ru"))).strip().lower()
@@ -1576,7 +1759,7 @@ class BotWebWindow(QMainWindow):
                     "MEXC_API_SECRET": sec,
                 }
             )
-            self._append_log("[GUI-WEB] API ключи сохранены в .env")
+            self._append_log("[GUI-WEB] API ключи сохранены в .env.local")
             self._emit_toast("API ключи сохранены", "ok")
         except Exception as exc:
             self._append_log(f"[GUI-WEB] Ошибка сохранения API: {exc}")
@@ -1718,27 +1901,7 @@ class BotWebWindow(QMainWindow):
             return json.dumps({"ok": False, "message": f"advisory probe error: {exc}"}, ensure_ascii=False)
 
     def _upsert_env_values(self, values: dict[str, str]) -> None:
-        lines: list[str] = []
-        if ENV_PATH.exists():
-            lines = ENV_PATH.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-        out: list[str] = []
-        seen: set[str] = set()
-        for ln in lines:
-            s = ln.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                out.append(ln)
-                continue
-            k, _ = s.split("=", 1)
-            key = str(k or "").strip()
-            if key in values:
-                out.append(f"{key}={values[key]}")
-                seen.add(key)
-            else:
-                out.append(ln)
-        for k, v in values.items():
-            if k not in seen:
-                out.append(f"{k}={v}")
-        ENV_PATH.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+        upsert_env_layers(APP_DIR, values)
 
     def get_ui_state_json(self) -> str:
         return json.dumps(self._ui_state if isinstance(self._ui_state, dict) else {}, ensure_ascii=False)
@@ -1831,10 +1994,12 @@ class BotWebWindow(QMainWindow):
         has_open_position_live = bool(live.get("has_open_position", False))
         event_raw = str(live.get("event", "-") or "-").strip()
         event_norm = event_raw.lower()
+        live_human_reason = _repair_mojibake_ru(str(live.get("human_reason", "") or "").strip())
+        built_human_reason = _repair_mojibake_ru(build_human_reason(live) or "")
         status_reason = (
             "Бот не запущен"
             if not running
-            else _repair_mojibake_ru(build_human_reason(live) or str(live.get("human_reason", "-")) or "-")
+            else (live_human_reason or built_human_reason or "-")
         )
         status_event = event_raw
         if running and has_open_position_live and event_norm == "cycle_busy":
@@ -1861,18 +2026,10 @@ class BotWebWindow(QMainWindow):
             else {}
         )
         chart_live = live.get("chart", {}) if isinstance(live.get("chart"), dict) else {}
-        chart_candles = chart_live.get("candles", []) if isinstance(chart_live.get("candles", []), list) else []
-        chart_symbol = _sym(str(live.get("symbol", "-")))
-        if chart_symbol != self._last_chart_symbol:
-            self._last_chart_candles = []
-            self._last_chart_symbol = chart_symbol
-        if chart_candles:
-            self._last_chart_candles = chart_candles[-120:]
-        elif self._last_chart_candles:
-            chart_candles = list(self._last_chart_candles)
-        else:
-            chart_candles = []
-            self._last_chart_candles = []
+        chart_candles = self._resolve_chart_candles(
+            str(live.get("symbol", "-")),
+            chart_live.get("candles", []) if isinstance(chart_live.get("candles", []), list) else [],
+        )
         telemetry = telemetry_live
         audit_summary = self._audit_summary(effective_mode, window=180)
         session_report = _read_json(SESSION_REPORT_PATH)
@@ -1927,6 +2084,7 @@ class BotWebWindow(QMainWindow):
         ai_quality_pct = _safe_float(live.get("ai_entry_quality"), 0.0) * 100.0
         expected_edge_pct = _safe_float(live.get("expected_edge_pct"), 0.0)
         min_edge_pct = max(1e-9, _safe_float(live.get("min_expected_edge_pct"), 0.0))
+        data_quality_score = _safe_float(live.get("data_quality_score"), 0.0)
         edge_ratio_score = max(0.0, min(130.0, (expected_edge_pct / min_edge_pct) * 100.0)) if min_edge_pct > 0 else 0.0
         if entry_total >= 8:
             decision_health = (
@@ -1945,20 +2103,49 @@ class BotWebWindow(QMainWindow):
 
         warnings: list[str] = []
         if bool(rg.get("locked", False)):
-            warnings.append(f"Guard lock: {str(rg.get('lock_reason', 'unknown'))}")
+            warnings.append(f"Защитная блокировка: {str(rg.get('lock_reason', 'unknown'))}")
         if bool(live.get("market_data_stale", False)):
             warnings.append("Рыночные данные устарели")
+        if data_quality_score > 0 and data_quality_score < 0.70:
+            warnings.append(f"Качество рыночных данных снижено: {data_quality_score:.2f}")
+        ticker_rest_backoff_sec = max(0.0, _safe_float(live.get("ticker_rest_backoff_sec"), 0.0))
+        tickers24_rest_backoff_sec = max(0.0, _safe_float(live.get("tickers24_rest_backoff_sec"), 0.0))
+        ticker_rest_fail_count = _safe_int(live.get("ticker_rest_fail_count"), 0)
+        tickers24_rest_fail_count = _safe_int(live.get("tickers24_rest_fail_count"), 0)
+        if tickers24_rest_backoff_sec > 0:
+            warnings.append(
+                f"REST 24h ticker временно приглушен: бот работает на WS/cache ({tickers24_rest_backoff_sec:.0f}s)."
+            )
+        elif ticker_rest_backoff_sec > 0:
+            warnings.append(
+                f"REST ticker по активному символу временно приглушен: используется WS/cache ({ticker_rest_backoff_sec:.0f}s)."
+            )
+        universe_source = str(live.get("universe_source", "") or "").strip()
+        universe_effective_limit = _safe_int(live.get("universe_effective_limit"), 0)
+        universe_selected_count = _safe_int(live.get("universe_selected_count"), 0)
+        if universe_source == "preferred_fallback":
+            warnings.append("Сканирование рынка сузилось до приоритетных пар из-за деградации market-data.")
+        elif universe_effective_limit > 0 and universe_selected_count > universe_effective_limit:
+            warnings.append("Сканирование рынка расширилось сильнее ожидаемого: проверь лимиты символов.")
+        deadlock_soft_relax = _safe_float(live.get("deadlock_soft_relax"), 0.0)
+        deadlock_conf_relax = _safe_float(live.get("deadlock_conf_relax"), 0.0)
+        deadlock_debounce_relax = _safe_int(live.get("deadlock_debounce_relax"), 0)
+        if deadlock_soft_relax > 0 or deadlock_conf_relax > 0 or deadlock_debounce_relax > 0:
+            warnings.append("Включено антизалипание: часть порогов входа временно ослаблена.")
         if not bool(live.get("expected_edge_ok", True)):
             warnings.append("Ожидаемое преимущество ниже порога")
+        current_block_summary = str(live.get("buy_block_summary", "") or "").strip()
+        if current_block_summary and str(live.get("event", "") or "") in {"training_no_signal", "entry_blocked", "risk_guard_blocked"}:
+            warnings.append(f"Текущий стоп-фактор входа: {current_block_summary}")
         if bool(live.get("short_model_weak", False)):
-            warnings.append("short_model_weak=true (для spot это инфо)")
+            warnings.append("Модель short сейчас слабее обычного (для spot это просто информация).")
         if engine_backend != "python" and not bool(engine_backend_status.get("healthy", False)):
-            warnings.append("Внешний движок недоступен: используется python fallback.")
+            warnings.append("Внешний движок недоступен: используется резервный Python-режим.")
         if bool(engine_backend_status.get("exec_degraded", False)):
             left_sec = _safe_float(engine_backend_status.get("exec_degraded_left_sec"), 0.0)
-            warnings.append(f"Gateway временно в деградации: fallback на python ({left_sec:.0f}s).")
+            warnings.append(f"Шлюз исполнения временно в деградации: резервный Python-режим ({left_sec:.0f}s).")
         if bool(engine_backend_status.get("live_strict_fallback_triggered", False)):
-            warnings.append("Live strict автоматически откатан в soft из-за проблем backend.")
+            warnings.append("Строгий live-режим автоматически смягчён из-за проблем backend.")
         if running and cycle_health < 35:
             warnings.append("Цикл обновляется нестабильно (высокая задержка телеметрии).")
         if effective_mode == "training" and not bool(live.get("exchange_balance_trusted", False)):
@@ -1966,9 +2153,9 @@ class BotWebWindow(QMainWindow):
         if bool(advisory.get("enabled", False)) and not bool(advisory.get("ok", False)):
             mute_for = _safe_float(advisory_status.get("mute_for_sec"), 0.0)
             if mute_for > 0:
-                warnings.append(f"Advisory временно muted ({mute_for:.0f}s), используется только внутренний AI.")
+                warnings.append(f"Внешний advisory временно приглушён ({mute_for:.0f}s), используется только внутренний AI.")
             elif _safe_int(advisory_status.get("err_count"), 0) > 0:
-                warnings.append("Advisory недоступен, используется только внутренний AI.")
+                warnings.append("Внешний advisory недоступен, используется только внутренний AI.")
 
         rollout_phase = str(engine_backend_status.get("rollout_phase", "-") or "-")
         ready_live_strict = bool(engine_backend_status.get("ready_for_live_strict", False))
@@ -1976,9 +2163,27 @@ class BotWebWindow(QMainWindow):
         strict_mode_on = bool(engine_backend_status.get("strict_mode", False))
         if effective_mode == "live":
             if (not strict_mode_on) and ready_live_strict:
-                warnings.append("Backend готов: можно перейти на strict live.")
+                warnings.append("Backend готов: можно перейти на строгий live-режим.")
             if strict_mode_on and rec_live_mode == "soft":
-                warnings.append("Рекомендуется soft режим live: backend нестабилен для strict.")
+                warnings.append("Рекомендуется мягкий live-режим: backend нестабилен для strict.")
+        no_entry_summary = "-"
+        if running and not has_open_position_live:
+            if bool(live.get("market_data_stale", False)):
+                no_entry_summary = "Нет входа: рыночные данные устарели."
+            elif current_block_summary:
+                no_entry_summary = f"Нет входа: {current_block_summary}."
+            else:
+                primary_reason = str(live.get("entry_policy_primary_reason", "") or "").strip()
+                if primary_reason and primary_reason != "-":
+                    no_entry_summary = f"Нет входа: {primary_reason}."
+                else:
+                    no_entry_summary = str(status_reason or "-")
+        signal_explainer = (
+            [str(x).strip() for x in live.get("signal_explainer", []) if str(x).strip()]
+            if isinstance(live.get("signal_explainer"), list)
+            else []
+        )
+        signal_reason = str(live.get("signal_reason", "") or "").strip()
         ui_lang = str(self._ui_state.get("lang", "ru")).strip().lower()
         if ui_lang not in {"ru", "en"}:
             ui_lang = "ru"
@@ -2008,15 +2213,15 @@ class BotWebWindow(QMainWindow):
                 "advisory_ok": bool(advisory.get("ok", False)),
                 "advisory_muted": (_safe_float(advisory_status.get("mute_for_sec"), 0.0) > 0.0),
                 "advisory_status_text": (
-                    "Advisory: ON"
+                    "Advisory: ВКЛ"
                     if bool(advisory.get("enabled", False)) and bool(advisory.get("ok", False))
                     else (
-                        "Advisory: MUTED"
+                        "Advisory: ПРИГЛУШЕН"
                         if bool(advisory.get("enabled", False)) and (_safe_float(advisory_status.get("mute_for_sec"), 0.0) > 0.0)
                         else (
-                            "Advisory: OFF"
+                            "Advisory: ОТКЛ"
                             if bool(advisory.get("enabled", False))
-                            else "Advisory: DISABLED"
+                            else "Advisory: НЕДОСТУПЕН"
                         )
                     )
                 ),
@@ -2033,8 +2238,13 @@ class BotWebWindow(QMainWindow):
                 "pid": int(self.process.pid) if self.process else _safe_int(live.get("bot_pid"), 0),
                 "cycle": _safe_int(live.get("cycle_index"), 0),
                 "reason": status_reason,
+                "no_entry_summary": no_entry_summary,
                 "symbol": _sym(str(live.get("symbol", "-"))),
                 "event": status_event,
+                "has_open_position": has_open_position_live,
+                "signal_reason": signal_reason,
+                "signal_explainer": signal_explainer[:4],
+                "data_quality_score": round(data_quality_score, 3),
             },
             "balance": {
                 "exchange_usdt": round(
@@ -2090,6 +2300,7 @@ class BotWebWindow(QMainWindow):
                 "anomaly": round(_safe_float(live.get("anomaly_score")), 2),
                 "data_stale": bool(live.get("market_data_stale", False)),
                 "volatility": round(_safe_float(live.get("market_volatility")), 4),
+                "data_quality_score": round(data_quality_score, 3),
             },
             "guard": {
                 "locked": bool(rg.get("locked", False)),
@@ -2122,12 +2333,28 @@ class BotWebWindow(QMainWindow):
                 "sample_size": _safe_int(audit_summary.get("sample_size"), 0),
                 "api_err": api_err_count,
                 "api_err_max": api_err_max,
+                "ticker_rest_fail_count": ticker_rest_fail_count,
+                "ticker_rest_backoff_sec": round(ticker_rest_backoff_sec, 1),
+                "tickers24_rest_fail_count": tickers24_rest_fail_count,
+                "tickers24_rest_backoff_sec": round(tickers24_rest_backoff_sec, 1),
+                "universe_source": universe_source or "-",
+                "universe_effective_limit": universe_effective_limit,
+                "universe_selected_count": universe_selected_count,
+                "universe_preferred_count": _safe_int(live.get("universe_preferred_count"), 0),
+                "universe_tickers_failed": bool(live.get("universe_tickers_failed", False)),
+                "deadlock_soft_relax": round(deadlock_soft_relax, 4),
+                "deadlock_conf_relax": round(deadlock_conf_relax, 4),
+                "deadlock_debounce_relax": deadlock_debounce_relax,
                 "cycle_health_score": round(cycle_health, 1),
                 "decision_health_score": round(decision_health, 1),
                 "exec_slippage_bps": round(_safe_float(live.get("exec_slippage_ema_bps"), 0.0), 2),
                 "loss_streak_live": _safe_int(live.get("loss_streak_live"), 0),
                 "position_risk_source": str(live.get("position_risk_source", "-") or "-"),
                 "entry_policy_primary_reason": str(live.get("entry_policy_primary_reason", "") or "-"),
+                "current_block_summary": current_block_summary or "-",
+                "current_block_reason_count": _safe_int(live.get("buy_block_reason_count"), 0),
+                "signal_reason": signal_reason or "-",
+                "data_quality_score": round(data_quality_score, 3),
                 "engine_backend": engine_backend,
                 "engine_healthy": bool(engine_backend_status.get("healthy", engine_backend == "python")),
                 "engine_mode": str(engine_backend_status.get("mode", "native") or "native"),
@@ -2159,7 +2386,7 @@ class BotWebWindow(QMainWindow):
             },
             "warnings": warnings,
             "recent_orders": orders[:30],
-            "logs": list(self._log_all)[-360:],
+            "logs": list(self._log_all)[-180:],
             "log_counts": {
                 "all": len(self._log_all),
                 "trade": len(self._log_trade),
@@ -2288,7 +2515,7 @@ class BotWebWindow(QMainWindow):
             self._retune_timers(state)
             try:
                 controls = state.get("controls", {}) if isinstance(state.get("controls"), dict) else {}
-                if bool(controls.get("running", False)):
+                if bool(controls.get("running", False)) and (time.time() - float(getattr(self, "_last_proc_guard_scan_ts", 0.0))) >= 20.0:
                     self._enforce_single_bot_process(force=False)
             except Exception:
                 pass
@@ -2313,8 +2540,13 @@ class BotWebWindow(QMainWindow):
             running = bool(controls.get("running", False))
             with self._proc_lock:
                 proc_busy = bool(self._proc_op_busy)
-            target_runtime = 380 if (running or proc_busy) else 900
-            target_log = 180 if (running or proc_busy) else 320
+            ui_throttled = self.isMinimized() or (not self.isActiveWindow())
+            if ui_throttled:
+                target_runtime = 1400 if (running or proc_busy) else 2000
+                target_log = 520 if (running or proc_busy) else 800
+            else:
+                target_runtime = 380 if (running or proc_busy) else 900
+                target_log = 180 if (running or proc_busy) else 320
 
             if target_runtime != int(getattr(self, "_runtime_timer_interval_ms", 0)):
                 self.timer.setInterval(int(target_runtime))
@@ -2331,7 +2563,7 @@ class BotWebWindow(QMainWindow):
             running = bool(controls.get("running", False))
             now_ts = time.time()
             # Keep side tabs (session/health derived blocks) reasonably fresh while bot is active.
-            if running and (now_ts - self._last_session_report_ts) >= 25.0:
+            if running and (now_ts - self._last_session_report_ts) >= 90.0:
                 self.refresh_health_report(quiet=True)
                 self._last_session_report_ts = now_ts
         except Exception:
@@ -2404,6 +2636,8 @@ class BotWebWindow(QMainWindow):
 
 def main() -> int:
     _hide_windows_console()
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     win = BotWebWindow()
     win.showMaximized()
